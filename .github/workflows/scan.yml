@@ -2,10 +2,7 @@ name: Daily DSE Stock Scan
 
 on:
   schedule:
-    # Runs at 9:00 AM UTC, which is 3:00 PM in Bangladesh (UTC+6).
-    # Sunday to Thursday (0-4). DSE closes at 2:00 PM, so this runs 1 hour after closing.
-    - cron: '0 9 * * 0-4'
-  # Allows you to run it manually from the Actions tab for testing
+    - cron: '0 9 * * 0-4' # Sunday to Thursday at 3:00 PM BD time
   workflow_dispatch:
 
 permissions:
@@ -39,6 +36,13 @@ jobs:
 
       - name: Ensure Report Directory Exists
         run: mkdir -p Stock_Report/bangla_summary
+
+      - name: Set Latest Report as Homepage
+        run: |
+          cd Stock_Report/bangla_summary
+          LATEST_FILE=$(ls -t *.html | head -n 1)
+          echo "Copying $LATEST_FILE to index.html"
+          cp "$LATEST_FILE" index.html
 
       - name: Upload Report as Artifact
         uses: actions/upload-artifact@v4
