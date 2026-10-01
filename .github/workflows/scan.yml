@@ -37,6 +37,7 @@ jobs:
       - name: Ensure Report Directory Exists
         run: mkdir -p Stock_Report/bangla_summary
 
+      # THIS IS THE NEW STEP
       - name: Set Latest Report as Homepage
         run: |
           cd Stock_Report/bangla_summary
