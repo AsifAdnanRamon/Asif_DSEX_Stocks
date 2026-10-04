@@ -697,24 +697,31 @@ class HistoricalDataCollector:
                 pass
         return None
 
-    def _from_dse_archive(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-        """
-        Direct DSE day_end_archive scraper — fallback when bdshare is blocked (HTTP 410).
-        Uses https://www.dse.com.bd/day_end_archive.php — same host as /api/live/prices,
-        which is known to be reachable from GitHub Actions.
-        """
-        url = "https://www.dse.com.bd/day_end_archive.php"
-        params = {
-            "startDate": start_date,
-            "endDate":   end_date,
-            "inst":      symbol.upper(),
-            "archive":   "data",
-        }
-        r = self.http.get(url, params=params)
+def _from_dse_archive(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    """
+    Scrape DSE day_end_archive — tries old.dsebd.org first (working mirror),
+    then falls back to www.dsebd.org.
+    """
+    base_urls = [
+        "https://old.dsebd.org/day_end_archive.php",
+        "https://www.dsebd.org/day_end_archive.php",
+        "https://www.dse.com.bd/day_end_archive.php",
+    ]
+    params = {
+        "startDate": start_date,
+        "endDate":   end_date,
+        "inst":      symbol.upper(),
+        "archive":   "data",
+    }
+
+    for base_url in base_urls:
+        r = self.http.get(base_url, params=params)
         if not r:
-            return None
+            continue
         try:
             soup = BeautifulSoup(r.text, "lxml")
+            # The new DSE archive uses multiple tables — find the one with
+            # a "Date" header and a "Close" or "LTP" column
             for table in soup.find_all("table"):
                 header_cells = table.find_all("th")
                 if not header_cells:
@@ -723,7 +730,7 @@ class HistoricalDataCollector:
                 headers = [c.get_text(strip=True).lower() for c in header_cells]
                 if not any("date" in h for h in headers):
                     continue
-                if not any(("close" in h) or ("ltp" in h) or ("price" in h) for h in headers):
+                if not any(("close" in h) or ("ltp" in h) or ("closep" in h) for h in headers):
                     continue
 
                 rows = []
@@ -735,23 +742,21 @@ class HistoricalDataCollector:
                     continue
 
                 df = pd.DataFrame(rows, columns=headers)
-
-                # Map DSE's column names → our standard names
+                # Map DSE column names → our standard names
                 rename = {
                     "trading code": "symbol", "date": "date",
                     "open": "open", "high": "high", "low": "low",
-                    "close": "close", "ltp": "close",
+                    "close": "close", "ltp": "close", "closep": "close",
+                    "openp": "open",
                     "volume": "volume", "trade": "volume",
                 }
                 df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-
                 out = self._normalize(df, symbol)
                 if out is not None and len(out) >= 20:
                     return out
         except Exception:
-            pass
-        return None
-
+            continue
+    return None
     def fetch(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         symbol = symbol.upper().strip()
         if symbol in ("DSEX", "DSES", "DS30", "DGEN"):
@@ -1026,12 +1031,14 @@ def get_dse_stock_list(force_refresh: bool = False) -> List[str]:
             filtered = [s for s in syms if s and not s.isdigit()
                         and s not in ("DSEX", "DSES", "DS30", "DGEN")]
             if len(filtered) >= 50:
+                print(f"✅ Live API returned {len(filtered)} symbols")
                 return filtered
-    except Exception:
-        pass
-    print("⚠️ Live API returned few symbols. Using comprehensive fallback list (~395 stocks).")
-    return list(_FALLBACK_SYMBOLS)
+        print(f"⚠️ Live API returned only {len(syms) if syms else 0} symbols")
+    except Exception as e:
+        print(f"⚠️ Live API symbol fetch failed: {e}")
 
+    print("⚠️ Using fallback symbol list (395 stocks)")
+    return list(_FALLBACK_SYMBOLS)
 
 # ==================== COMPANY INFO ====================
 _COMPANY_INFO_CACHE: Dict[str, dict] = {}
@@ -4597,7 +4604,6 @@ def _print_clean_summary(reports, failed, total, failures_csv_path=None):
 
 
 def _probe_history_sources():
-    """v1.28: quick probe at batch-scan startup — test both history routes."""
     sym = "BATBC"
     end = dt.date.today()
     start = end - timedelta(days=60)
@@ -4605,25 +4611,44 @@ def _probe_history_sources():
     end_str = end.strftime("%Y-%m-%d")
 
     print(f"🔎 Probing history sources for {sym} ({start_str} → {end_str}) …")
-    try:
-        df_bd = _HIST_COLLECTOR._from_bdshare(sym, start_str, end_str)
-        if df_bd is not None and len(df_bd) >= 20:
-            print(f"   ✅ bdshare           : {len(df_bd)} rows")
-        else:
-            print(f"   ⚠️  bdshare           : no rows (likely HTTP 410)")
-    except Exception as e:
-        print(f"   ❌ bdshare           : {type(e).__name__}: {str(e)[:60]}")
 
-    try:
-        df_dse = _HIST_COLLECTOR._from_dse_archive(sym, start_str, end_str)
-        if df_dse is not None and len(df_dse) >= 20:
-            print(f"   ✅ DSE archive       : {len(df_dse)} rows  ← fallback healthy")
-        else:
-            print(f"   ⚠️  DSE archive       : no rows")
-    except Exception as e:
-        print(f"   ❌ DSE archive       : {type(e).__name__}: {str(e)[:60]}")
+    for label, url in [
+        ("old.dsebd.org", "https://old.dsebd.org/day_end_archive.php"),
+        ("www.dsebd.org", "https://www.dsebd.org/day_end_archive.php"),
+        ("www.dse.com.bd", "https://www.dse.com.bd/day_end_archive.php"),
+    ]:
+        try:
+            r = _HTTP.get(url, params={
+                "startDate": start_str, "endDate": end_str,
+                "inst": sym, "archive": "data"})
+            if r and len(r.text) > 500:
+                soup = BeautifulSoup(r.text, "lxml")
+                tables = soup.find_all("table")
+                print(f"   ✅ {label:<20s}: HTTP 200, {len(tables)} tables")
+            else:
+                print(f"   ⚠️  {label:<20s}: empty/short response")
+        except Exception as e:
+            print(f"   ❌ {label:<20s}: {type(e).__name__}: {str(e)[:60]}")
     print()
 
+def _probe_live_api():
+    """v1.28.1: Probe the live API to verify it returns data."""
+    print("🔎 Probing live API …")
+    try:
+        _LIVE_CACHE.prefetch()
+        df = _LIVE_CACHE.get_all()
+        if df is not None and not df.empty:
+            print(f"   ✅ Live API: {len(df)} symbols returned")
+            # Safely show a sample
+            cols = [c for c in ["code", "ltp", "volume"] if c in df.columns]
+            if cols:
+                sample = df.head(3)[cols].to_string(index=False)
+                print(f"   Sample:\n{sample}")
+        else:
+            print("   ❌ Live API: returned no data (Empty DataFrame)")
+    except Exception as e:
+        print(f"   ❌ Live API: Failed with error: {e}")
+    print()
 
 def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined=True, ab_mode='LONG'):
     print("\n" + "=" * 80)
@@ -4635,6 +4660,11 @@ def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined
         _LIVE_CACHE.prefetch()
     except Exception:
         print("⚠️ Prefetch failed, will retry per-symbol.")
+
+    # --- ADDED: Probe both sources so we can see what is failing ---
+    _probe_live_api()
+    _probe_history_sources()
+    # ---------------------------------------------------------------
 
     # v1.28: probe both history sources so you can see at a glance what's working
     _probe_history_sources()
