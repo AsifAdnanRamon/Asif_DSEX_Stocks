@@ -425,33 +425,49 @@ class HistoricalDataCollector:
         return None
 
     def _from_dse_archive(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-        base_urls = ["https://old.dsebd.org/day_end_archive.php", "https://www.dsebd.org/day_end_archive.php", "https://www.dse.com.bd/day_end_archive.php"]
-        params = {"startDate": start_date, "endDate": end_date, "inst": symbol.upper(), "archive": "data"}
-        for base_url in base_urls:
-            r = self.http.get(base_url, params=params)
-            if not r: continue
-            try:
-                soup = BeautifulSoup(r.text, "lxml")
-                for table in soup.find_all("table"):
-                    header_cells = table.find_all("th")
-                    if not header_cells:
-                        first_tr = table.find("tr")
-                        header_cells = first_tr.find_all("td") if first_tr else []
-                    headers = [c.get_text(strip=True).lower() for c in header_cells]
-                    if not any("date" in h for h in headers): continue
-                    if not any(("close" in h) or ("ltp" in h) or ("closep" in h) for h in headers): continue
-                    rows = []
-                    for tr in table.find_all("tr")[1:]:
-                        cells = [td.get_text(strip=True).replace(",", "") for td in tr.find_all("td")]
-                        if len(cells) >= len(headers): rows.append(cells[:len(headers)])
-                    if not rows: continue
-                    df = pd.DataFrame(rows, columns=headers)
-                    df = df.rename(columns={"trading code": "symbol", "date": "date", "open": "open", "high": "high", "low": "low", "close": "close", "ltp": "close", "closep": "close", "openp": "open", "volume": "volume", "trade": "volume"})
-                    out = self._normalize(df, symbol)
-                    if out is not None and len(out) >= 20: return out
-            except Exception: continue
-        return None
+        """
+        v1.30: Uses the NEW working DSE JSON endpoint.
+        Old day_end_archive.php pages are permanently retired (HTTP 410).
+        """
+        url = "https://dsebd.org/api/live/data-archive/day-end"
+        params = {
+            "from": start_date,
+            "to":   end_date,
+            "inst": symbol.upper(),
+        }
+        r = self.http.get(url, params=params)
+        if not r:
+            return None
+        try:
+            payload = r.json()
+        except Exception:
+            return None
 
+        # The API may return either a list of rows, or {"data": [...]}
+        rows = payload if isinstance(payload, list) else payload.get("data") or payload.get("rows") or []
+        if not rows:
+            return None
+
+        try:
+            df = pd.DataFrame(rows)
+            # Normalize column names (API uses lowercase already, but be safe)
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            rename = {
+                "tradingcode": "symbol", "code": "symbol",
+                "date": "date", "tradedate": "date",
+                "open": "open", "openp": "open",
+                "high": "high", "low": "low",
+                "close": "close", "closep": "close", "ltp": "close",
+                "volume": "volume", "trade": "volume",
+            }
+            df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+            out = self._normalize(df, symbol)
+            if out is not None and len(out) >= 20:
+                return out
+        except Exception:
+            pass
+        return None
+      
     def fetch(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         symbol = symbol.upper().strip()
         if symbol in ("DSEX", "DSES", "DS30", "DGEN"): return None
