@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DSE Canvas Scanner – v1.29
+DSE Canvas Scanner – v1.31
 ================================================================================
-CHANGES FROM v1.28 → v1.29:
-  • Added `_probe_live_api()` and `_probe_history_sources()` for diagnostics.
-  • DSE archive fallback now tries `old.dsebd.org` FIRST (the working mirror),
-    then `www.dsebd.org`, then `www.dse.com.bd`.
-  • Local historical cache is checked BEFORE any network request.
-  • Self-healing cache: live API snapshots are appended to the local cache.
-  • All other layers identical to v1.28.
+CHANGES FROM v1.30 → v1.31:
+  • HistoricalDataCollector now uses the NEW DSE JSON API:
+        https://dsebd.org/api/live/data-archive/day-end
+    (Old day_end_archive.php is permanently retired.)
+  • Weekend handling: volume projection returns 'WEEKEND' on Fri/Sat so no
+    false VOL_IGNITION is generated during closed markets.
+  • Self-healing cache no longer clobbers authoritative EOD rows from the API.
+  • Full 6-tab Bangla HTML generator restored (no stub).
+  • Diagnostic probes for live API and history sources at batch-scan start.
 ================================================================================
 """
 
@@ -34,13 +36,11 @@ def install(pkg, extra_args=None):
 for pkg in ["pandas", "numpy", "requests", "beautifulsoup4", "lxml", "urllib3", "scipy"]:
     try: __import__(pkg.replace("-", "_"))
     except ImportError:
-        print(f"📦 Installing {pkg} ...")
-        install(pkg)
+        print(f"📦 Installing {pkg} ..."); install(pkg)
 
 try: import bdshare as _bdshare_probe
 except ImportError:
-    print("📦 Installing bdshare ...")
-    install("bdshare", extra_args=["--no-deps"])
+    print("📦 Installing bdshare ..."); install("bdshare", extra_args=["--no-deps"])
 
 try:
     import site as _site_mod
@@ -157,7 +157,7 @@ def compute_data_health(realtime, last_fetch_utc, now=None):
 def write_data_health_cache(cache_path: Path, symbol: str, fetch_utc: datetime, source: str = "live") -> None:
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        data: Dict[str, Dict] = {}
+        data = {}
         if cache_path.exists():
             try: data = json.loads(cache_path.read_text())
             except json.JSONDecodeError: data = {}
@@ -184,6 +184,10 @@ def get_session_minutes_total() -> int:
     return ((DSE_SESSION_END.hour * 60 + DSE_SESSION_END.minute) - (DSE_SESSION_START.hour * 60 + DSE_SESSION_START.minute))
 
 def project_full_day_volume(live_vol: float) -> Tuple[float, str]:
+    """v1.31: returns 'WEEKEND' on Fri/Sat to prevent false VOL_IGNITION."""
+    today = dt.date.today()
+    if today.weekday() in (4, 5):  # Friday=4, Saturday=5
+        return live_vol, 'WEEKEND'
     raw_min, total_min = get_session_minutes_elapsed(), get_session_minutes_total()
     if raw_min < 0: return live_vol, 'PRE_OPEN'
     if raw_min >= total_min: return live_vol, 'CLOSED'
@@ -230,13 +234,11 @@ def get_forecast_thresholds(regime):
 # ==================== DB ====================
 DB_PATH = "market_data.db"
 DB_LOCK = threading.Lock()
+
 class MarketDatabase:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
-        self.conn = None
-        self._init_db()
-    def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         c = self.conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS stock_data (symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER, PRIMARY KEY (symbol, date))''')
         c.execute('''CREATE TABLE IF NOT EXISTS analysis_cache (symbol TEXT, timestamp DATETIME, price REAL, rsi REAL, macd_status TEXT, adx REAL, atr REAL, signal_type TEXT, wyckoff_phase TEXT, vpoc REAL, vah REAL, val REAL, PRIMARY KEY (symbol, timestamp))''')
@@ -247,7 +249,8 @@ class MarketDatabase:
             for _, row in df.iterrows():
                 try:
                     ds = row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date'])
-                    c.execute('''INSERT OR REPLACE INTO stock_data (symbol,date,open,high,low,close,volume) VALUES (?,?,?,?,?,?,?)''', (symbol, ds, float(row['open']), float(row['high']), float(row['low']), float(row['close']), int(row['volume'])))
+                    c.execute('INSERT OR REPLACE INTO stock_data VALUES (?,?,?,?,?,?,?)',
+                              (symbol, ds, float(row['open']), float(row['high']), float(row['low']), float(row['close']), int(row['volume'])))
                 except Exception: pass
             self.conn.commit()
     def close(self):
@@ -256,13 +259,14 @@ class MarketDatabase:
 # ==================== HTTP SESSION ====================
 SESSION = requests.Session()
 SESSION.verify = False
+
 @dataclass
 class DSEConfig:
     verify_ssl: bool = False
     min_request_interval: float = 0.4
     max_retries: int = 3
     backoff_base: float = 1.5
-    user_agent: str = "dse-swing-analyzer/3.3 (personal research)"
+    user_agent: str = "Mozilla/5.0 (compatible; dse-swing-analyzer/3.4)"
     connect_timeout: float = 5.0
     read_timeout: float = 20.0
 
@@ -272,9 +276,8 @@ class PoliteSession:
         self.session = requests.Session()
         self.session.verify = cfg.verify_ssl
         self.session.headers.update({"User-Agent": cfg.user_agent, "Accept": "application/json, text/html, */*", "Accept-Language": "en-US,en;q=0.5"})
-        self._last_hit: dict = {}
-        self._lock = threading.Lock()
-    def get(self, url: str, **kw) -> Optional[requests.Response]:
+        self._last_hit, self._lock = {}, threading.Lock()
+    def get(self, url, **kw):
         host = urlparse(url).netloc
         for attempt in range(self.cfg.max_retries):
             if attempt > 0: time.sleep(self.cfg.backoff_base ** (attempt - 1))
@@ -310,44 +313,51 @@ _BDSHARE_MKT_HIST = _bd_fn("get_market_info")
 _BDSHARE_COMPANY_INFO = _bd_fn("get_company_info")
 
 # ==================== LIVE MARKET CACHE ====================
-DSE_LIVE_PRICES_URL = "https://www.dse.com.bd/api/live/prices"
-DSE_LIVE_MARKET_URL = "https://www.dse.com.bd/api/live/market"
+DSE_LIVE_PRICES_URLS = ["https://www.dse.com.bd/api/live/prices", "https://dsebd.org/api/live/prices"]
+DSE_LIVE_MARKET_URLS = ["https://www.dse.com.bd/api/live/market", "https://dsebd.org/api/live/market"]
 _LIVE_NUMERIC_COLS = ("ltp", "ycp", "open", "high", "low", "close", "volume", "value", "trades", "percent")
 
 class LiveMarketCache:
-    def __init__(self, http: PoliteSession):
+    def __init__(self, http):
         self.http = http
         self._lock = threading.RLock()
-        self._prices_df: Optional[pd.DataFrame] = None
-        self._prices_ts: float = 0.0
-        self._market: Optional[dict] = None
-        self._market_ts: float = 0.0
+        self._prices_df, self._prices_ts = None, 0.0
+        self._market, self._market_ts = None, 0.0
         self._fail_count = 0
-    def _refresh_prices_locked(self) -> None:
-        r = self.http.get(DSE_LIVE_PRICES_URL)
-        if not r: self._fail_count += 1; return
-        try: payload = r.json()
-        except Exception: self._fail_count += 1; return
-        cols, rows = payload.get("cols", []) or [], payload.get("rows", []) or []
-        if not cols or not rows: self._fail_count += 1; return
-        try:
-            df = pd.DataFrame(rows, columns=cols)
-            if "code" not in df.columns: self._fail_count += 1; return
-            df["code"] = df["code"].astype(str).str.upper().str.strip()
-            for c in _LIVE_NUMERIC_COLS:
-                if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-            if "close" in df.columns and "ltp" in df.columns: df.loc[df["close"] <= 0, "close"] = df.loc[df["close"] <= 0, "ltp"]
-            for c in ("sector", "assetType", "category", "board"):
-                if c in df.columns: df[c] = df[c].astype(str).fillna("")
-            self._prices_df, self._prices_ts, self._fail_count = df, time.monotonic(), 0
-        except Exception: self._fail_count += 1
-    def refresh_prices(self) -> None:
+
+    def _refresh_prices_locked(self):
+        for url in DSE_LIVE_PRICES_URLS:
+            r = self.http.get(url)
+            if not r: continue
+            try: payload = r.json()
+            except Exception: continue
+            cols, rows = payload.get("cols") or [], payload.get("rows") or []
+            if not cols or not rows: continue
+            try:
+                df = pd.DataFrame(rows, columns=cols)
+                if "code" not in df.columns: continue
+                df["code"] = df["code"].astype(str).str.upper().str.strip()
+                for c in _LIVE_NUMERIC_COLS:
+                    if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+                if "close" in df.columns and "ltp" in df.columns:
+                    m = df["close"] <= 0; df.loc[m, "close"] = df.loc[m, "ltp"]
+                for c in ("sector", "assetType", "category", "board"):
+                    if c in df.columns: df[c] = df[c].astype(str).fillna("")
+                self._prices_df, self._prices_ts, self._fail_count = df, time.monotonic(), 0
+                return
+            except Exception: continue
+        self._fail_count += 1
+
+    def refresh_prices(self):
         with self._lock: self._refresh_prices_locked()
-    def get_all(self) -> Optional[pd.DataFrame]:
+
+    def get_all(self):
         with self._lock:
-            if self._prices_df is None or (time.monotonic() - self._prices_ts) > LIVE_PRICES_TTL: self._refresh_prices_locked()
+            if self._prices_df is None or (time.monotonic() - self._prices_ts) > LIVE_PRICES_TTL:
+                self._refresh_prices_locked()
             return self._prices_df
-    def get_symbol(self, symbol: str) -> Optional[dict]:
+
+    def get_symbol(self, symbol):
         df = self.get_all()
         if df is None or df.empty: return None
         sym = symbol.upper().strip()
@@ -362,56 +372,87 @@ class LiveMarketCache:
                 "sector": str(r.get("sector", "") or ""), "asset_type": str(r.get("assetType", "") or ""),
                 "board": str(r.get("board", "") or ""), "source": "live", "_ohlc_source": True,
                 "date": dt.date.today().strftime("%Y-%m-%d")}
-    def get_symbols(self) -> List[str]:
+
+    def get_symbols(self):
         df = self.get_all()
         return sorted(df["code"].dropna().unique().tolist()) if df is not None and not df.empty else []
-    def _refresh_market_locked(self) -> None:
-        r = self.http.get(DSE_LIVE_MARKET_URL)
-        if r:
-            try:
-                payload = r.json()
-                if isinstance(payload, dict): self._market, self._market_ts = payload, time.monotonic()
-            except Exception: pass
-    def get_market(self) -> dict:
+
+    def _refresh_market_locked(self):
+        for url in DSE_LIVE_MARKET_URLS:
+            r = self.http.get(url)
+            if r:
+                try:
+                    payload = r.json()
+                    if isinstance(payload, dict):
+                        self._market, self._market_ts = payload, time.monotonic()
+                        return
+                except Exception: continue
+
+    def get_market(self):
         with self._lock:
-            if self._market is None or (time.monotonic() - self._market_ts) > LIVE_MARKET_TTL: self._refresh_market_locked()
+            if self._market is None or (time.monotonic() - self._market_ts) > LIVE_MARKET_TTL:
+                self._refresh_market_locked()
             return self._market or {}
-    def prefetch(self) -> None:
+
+    def prefetch(self):
         self.refresh_prices(); self.get_market()
 
 _LIVE_CACHE = LiveMarketCache(_HTTP)
 
-# ==================== HISTORICAL DATA ====================
+# ==================== HISTORICAL DATA (v1.31 — new JSON API) ====================
 class HistoricalDataCollector:
-    def __init__(self, http: PoliteSession):
+    def __init__(self, http):
         self.http = http
         self._lock = threading.Lock()
+
     @staticmethod
-    def _normalize(df: pd.DataFrame, symbol: str) -> Optional[pd.DataFrame]:
+    def _normalize(df, symbol):
         if df is None or len(df) == 0: return None
         try:
             d = df.copy()
             d.columns = [str(c).strip().lower() for c in d.columns]
-            d = d.rename(columns={"openp": "open", "closep": "close", "ltp": "close", "date_": "date", "trade_date": "date", "tradingcode": "symbol"})
+            d = d.rename(columns={"openp":"open","closep":"close","ltp":"close","date_":"date",
+                                   "trade_date":"date","tradingcode":"symbol","code":"symbol","tradedate":"date"})
             if "date" not in d.columns:
-                d = d.reset_index()
-                d.columns = [str(c).strip().lower() for c in d.columns]
-                if "index" in d.columns and "date" not in d.columns: d = d.rename(columns={"index": "date"})
+                d = d.reset_index(); d.columns = [str(c).strip().lower() for c in d.columns]
+                if "index" in d.columns and "date" not in d.columns:
+                    d = d.rename(columns={"index": "date"})
             if "date" not in d.columns: return None
             d["date"] = pd.to_datetime(d["date"], errors="coerce")
             d = d.dropna(subset=["date"])
             if d.empty: return None
-            for col in ["open", "high", "low", "close", "volume"]:
+            for col in ["open","high","low","close","volume"]:
                 if col not in d.columns: d[col] = 0.0
                 d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
-            for col in ["open", "high", "low"]:
-                mask = (d[col] <= 0) & (d["close"] > 0); d.loc[mask, col] = d.loc[mask, "close"]
+            for col in ["open","high","low"]:
+                m = (d[col] <= 0) & (d["close"] > 0); d.loc[m, col] = d.loc[m, "close"]
             d = d[d["close"] > 0]
             if len(d) < 20: return None
-            return d[["date", "open", "high", "low", "close", "volume"]].sort_values("date").reset_index(drop=True)
+            return d[["date","open","high","low","close","volume"]].sort_values("date").reset_index(drop=True)
         except Exception: return None
 
-    def _from_bdshare(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    def _from_new_json_api(self, symbol, start_date, end_date):
+        """v1.31 — the CURRENT working endpoint."""
+        urls = [
+            "https://dsebd.org/api/live/data-archive/day-end",
+            "https://www.dsebd.org/api/live/data-archive/day-end",
+            "https://www.dse.com.bd/api/live/data-archive/day-end",
+        ]
+        for url in urls:
+            try:
+                r = self.http.get(url, params={"from": start_date, "to": end_date, "inst": symbol.upper()})
+                if not r: continue
+                try: payload = r.json()
+                except Exception: continue
+                rows = payload if isinstance(payload, list) else (payload.get("data") or payload.get("rows") or [])
+                if not rows: continue
+                df = pd.DataFrame(rows)
+                out = self._normalize(df, symbol)
+                if out is not None and len(out) >= 20: return out
+            except Exception: continue
+        return None
+
+    def _from_bdshare(self, symbol, start_date, end_date):
         if _BDSHARE_HIST:
             try:
                 out = self._normalize(_BDSHARE_HIST(start_date, end_date, symbol.upper()), symbol)
@@ -424,57 +465,13 @@ class HistoricalDataCollector:
             except Exception: pass
         return None
 
-    def _from_dse_archive(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-        """
-        v1.30: Uses the NEW working DSE JSON endpoint.
-        Old day_end_archive.php pages are permanently retired (HTTP 410).
-        """
-        url = "https://dsebd.org/api/live/data-archive/day-end"
-        params = {
-            "from": start_date,
-            "to":   end_date,
-            "inst": symbol.upper(),
-        }
-        r = self.http.get(url, params=params)
-        if not r:
-            return None
-        try:
-            payload = r.json()
-        except Exception:
-            return None
-
-        # The API may return either a list of rows, or {"data": [...]}
-        rows = payload if isinstance(payload, list) else payload.get("data") or payload.get("rows") or []
-        if not rows:
-            return None
-
-        try:
-            df = pd.DataFrame(rows)
-            # Normalize column names (API uses lowercase already, but be safe)
-            df.columns = [str(c).strip().lower() for c in df.columns]
-            rename = {
-                "tradingcode": "symbol", "code": "symbol",
-                "date": "date", "tradedate": "date",
-                "open": "open", "openp": "open",
-                "high": "high", "low": "low",
-                "close": "close", "closep": "close", "ltp": "close",
-                "volume": "volume", "trade": "volume",
-            }
-            df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-            out = self._normalize(df, symbol)
-            if out is not None and len(out) >= 20:
-                return out
-        except Exception:
-            pass
-        return None
-      
-    def fetch(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    def fetch(self, symbol, start_date, end_date):
         symbol = symbol.upper().strip()
-        if symbol in ("DSEX", "DSES", "DS30", "DGEN"): return None
+        if symbol in ("DSEX","DSES","DS30","DGEN"): return None
         with self._lock:
-            df = self._from_bdshare(symbol, start_date, end_date)
+            df = self._from_new_json_api(symbol, start_date, end_date)
             if df is not None: return df
-            return self._from_dse_archive(symbol, start_date, end_date)
+            return self._from_bdshare(symbol, start_date, end_date)
 
 _HIST_COLLECTOR = HistoricalDataCollector(_HTTP)
 
@@ -483,10 +480,10 @@ DSEX_CACHE_FILE = f"{CACHE_DIR}/DSEX_historical.csv"
 BREADTH_CACHE_FILE = f"{CACHE_DIR}/breadth_history.csv"
 _BREADTH_HISTORY = None
 
-def _extract_dsex_from_market(market: dict) -> Optional[dict]:
+def _extract_dsex_from_market(market):
     if not market: return None
     try:
-        for key in ("indices", "index", "market", "summary"):
+        for key in ("indices","index","market","summary"):
             node = market.get(key)
             if isinstance(node, list):
                 for entry in node:
@@ -500,27 +497,12 @@ def _extract_dsex_from_market(market: dict) -> Optional[dict]:
     except Exception: pass
     return None
 
-def get_dsex_data() -> dict:
-    market = _LIVE_CACHE.get_market()
-    parsed = _extract_dsex_from_market(market) or {}
-    close = parsed.get("close", 0.0)
-    if close <= 0:
-        df = _LIVE_CACHE.get_all()
-        if df is not None and not df.empty and "percent" in df.columns:
-            parsed["advances"], parsed["declines"] = int((df["percent"] > 0).sum()), int((df["percent"] < 0).sum())
-            parsed["close"] = float(df["ltp"].mean()) if "ltp" in df.columns else 0.0
-    if parsed.get("advances") is not None and parsed.get("declines") is not None and (parsed["advances"] + parsed["declines"]) > 0:
-        try: save_breadth_data(dt.date.today(), int(parsed["advances"]), int(parsed["declines"]))
-        except Exception: pass
-    return parsed
-
 def load_breadth_history():
     global _BREADTH_HISTORY
     if _BREADTH_HISTORY is not None: return _BREADTH_HISTORY
     if os.path.exists(BREADTH_CACHE_FILE):
         try:
-            df = pd.read_csv(BREADTH_CACHE_FILE)
-            df['date'] = pd.to_datetime(df['date'])
+            df = pd.read_csv(BREADTH_CACHE_FILE); df['date'] = pd.to_datetime(df['date'])
             _BREADTH_HISTORY = df.to_dict('records'); return _BREADTH_HISTORY
         except Exception: pass
     _BREADTH_HISTORY = []; return _BREADTH_HISTORY
@@ -536,37 +518,6 @@ def save_breadth_data(date, advances, declines):
     try: pd.DataFrame(_BREADTH_HISTORY).to_csv(BREADTH_CACHE_FILE, index=False)
     except Exception: pass
 
-def get_dsex_historical() -> Optional[pd.Series]:
-    if os.path.exists(DSEX_CACHE_FILE):
-        try:
-            df = pd.read_csv(DSEX_CACHE_FILE)
-            if 'date' in df.columns and 'close' in df.columns:
-                df['date'] = pd.to_datetime(df['date'], errors='coerce'); df['close'] = pd.to_numeric(df['close'], errors='coerce')
-                df = df.dropna().sort_values('date').reset_index(drop=True)
-                if len(df) >= 50: return df['close']
-        except Exception: pass
-    end, start = dt.date.today(), dt.date.today() - timedelta(days=3*365)
-    for fn in (_BDSHARE_MKT_HIST_MORE, _BDSHARE_MKT_HIST):
-        if fn is None: continue
-        try:
-            try: df = fn(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-            except TypeError: df = fn()
-            if df is None or len(df) == 0: continue
-            d = df.copy(); d.columns = [str(c).strip().lower() for c in d.columns]
-            if "date" not in d.columns:
-                d = d.reset_index(); d.columns = [str(c).strip().lower() for c in d.columns]
-                if "index" in d.columns: d = d.rename(columns={"index": "date"})
-            dsex_col = next((c for c in d.columns if "dsex" in c.lower()), None)
-            if dsex_col is None: continue
-            out = pd.DataFrame({"date": pd.to_datetime(d["date"], errors="coerce"), "close": pd.to_numeric(d[dsex_col], errors="coerce")}).dropna()
-            out = out.sort_values("date").reset_index(drop=True)
-            if len(out) >= 50:
-                try: out.to_csv(DSEX_CACHE_FILE, index=False)
-                except Exception: pass
-                return out["close"]
-        except Exception: continue
-    return None
-
 def compute_breadth_metrics():
     h = load_breadth_history()
     if not h or len(h) < 40: return {'theta': 0.0, 'mcclellan': 0.0, 'condition': 'Neutral'}
@@ -575,7 +526,8 @@ def compute_breadth_metrics():
     df['ad_roc_21'] = df['ad_line'] - df['ad_line'].shift(21)
     df['kappa'] = df['ad_roc_21'].rolling(252).std()
     df['theta'] = np.tanh(df['ad_roc_21'] / df['kappa'].replace(0, np.nan))
-    df['ema19'] = df['net'].ewm(span=19, adjust=False).mean(); df['ema39'] = df['net'].ewm(span=39, adjust=False).mean()
+    df['ema19'] = df['net'].ewm(span=19, adjust=False).mean()
+    df['ema39'] = df['net'].ewm(span=39, adjust=False).mean()
     df['mcclellan'] = df['ema19'] - df['ema39']
     last = df.iloc[-1]; theta = last.get('theta', 0.0)
     if pd.isna(theta): theta = 0.0
@@ -600,25 +552,25 @@ def determine_regime(dsex):
     return {'regime': r, 'factor': f, 'above_200': above}
 
 # ==================== STOCK UNIVERSE ====================
-_FALLBACK_SYMBOLS = ['1JANATAMF', '1STPRIMFMF', 'AAMRANET', 'AAMRATECH', 'ABB1STMF', 'ABBANK', 'ACFL', 'ACI', 'ACIFORMULA', 'ACMELAB', 'ACMEPL', 'ACTIVEFINE', 'ADNTEL', 'ADVENT', 'AFCAGRO', 'AFTABAUTO', 'AGNISYSL', 'AGRANINS', 'AIBL1STIMF', 'AIL', 'AL-HAJTEX', 'ALARABANK', 'ALIF', 'ALLTEX', 'AMANFEED', 'AMBEEPHA', 'AMCL(PRAN)', 'ANLIMAYARN', 'ANWARGALV', 'AOL', 'APEXFOODS', 'APEXFOOT', 'APEXSPINN', 'APEXTANRY', 'APOLOISPAT', 'ARAMIT', 'ARAMITCEM', 'ARGONDENIM', 'ASIAINS', 'ASIAPACINS', 'ASIATICLAB', 'ATLASBANG', 'AZIZPIPES', 'BANGAS', 'BANKASIA', 'BARKAPOWER', 'BATASHOE', 'BATBC', 'BAYLEASING', 'BBS', 'BBSCABLES', 'BDAUTOCA', 'BDCOM', 'BDFINANCE', 'BDLAMPS', 'BDSERVICE', 'BDTHAI', 'BDTHAIFOOD', 'BDWELDING', 'BEACHHATCH', 'BEACONPHAR', 'BENGALWTL', 'BERGERPBL', 'BESTHLDNG', 'BEXIMCO', 'BGIC', 'BIFC', 'BNICL', 'BPML', 'BPPL', 'BRACBANK', 'BSC', 'BSCPLC', 'BSRMLTD', 'BSRMSTEEL', 'BXPHARMA', 'CAPITECGBF', 'CAPMBDBLMF', 'CAPMIBBLMF', 'CENTRALINS', 'CENTRALPHL', 'CITYBANK', 'CITYGENINS', 'CLICL', 'CNATEX', 'CONFIDCEM', 'CONTININS', 'COPPERTECH', 'CROWNCEMNT', 'CRYSTALINS', 'CVOPRL', 'DACCADYE', 'DAFODILCOM', 'DBH', 'DBH1STMF', 'DELTALIFE', 'DELTASPINN', 'DESCO', 'DESHBANDHU', 'DGIC', 'DHAKABANK', 'DHAKAINS', 'DOMINAGE', 'DOREENPWR', 'DSHGARME', 'DSSL', 'DULAMIACOT', 'DUTCHBANGL', 'EASTERNINS', 'EASTLAND', 'EASTRNLUB', 'EBL', 'EBL1STMF', 'EBLNRBMF', 'ECABLES', 'EGEN', 'EHL', 'EIL', 'EMERALDOIL', 'ENVOYTEX', 'EPGL', 'ESQUIRENIT', 'ETL', 'EXIM1STMF', 'EXIMBANK', 'FAMILYTEX', 'FARCHEM', 'FAREASTFIN', 'FAREASTLIF', 'FASFIN', 'FBFIF', 'FEDERALINS', 'FEKDIL', 'FINEFOODS', 'FIRSTFIN', 'FIRSTSBANK', 'FORTUNE', 'FUWANGCER', 'FUWANGFOOD', 'GBBPOWER', 'GEMINISEA', 'GENEXIL', 'GENNEXT', 'GHAIL', 'GHCL', 'GIB', 'GLDNJMF', 'GLOBALINS', 'GOLDENSON', 'GP', 'GPHISPAT', 'GQBALLPEN', 'GRAMEENS2', 'GREENDELMF', 'GREENDELT', 'GSPFINANCE', 'HAKKANIPUL', 'HAMI', 'HEIDELBCEM', 'HFL', 'HRTEX', 'HWAWELLTEX', 'IBNSINA', 'IBP', 'ICB', 'ICB3RDNRB', 'ICBAGRANI1', 'ICBAMCL2ND', 'ICBEPMF1S1', 'ICBIBANK', 'ICBSONALI1', 'ICICL', 'IDLC', 'IFADAUTOS', 'IFIC', 'IFIC1STMF', 'IFILISLMF1', 'ILFSL', 'INDEXAGRO', 'INTECH', 'INTRACO', 'IPDC', 'ISLAMIBANK', 'ISLAMICFIN', 'ISLAMIINS', 'ISNLTD', 'ITC', 'JAMUNABANK', 'JAMUNAOIL', 'JANATAINS', 'JHRML', 'JMISMDL', 'JUTESPINN', 'KARNAPHULI', 'KAY&QUE', 'KBPPWBIL', 'KDSALTD', 'KEYACOSMET', 'KOHINOOR', 'KPCL', 'KPPL', 'KTL', 'LANKABAFIN', 'LEGACYFOOT', 'LHB', 'LIBRAINFU', 'LINDEBD', 'LOVELLO', 'LRBDL', 'LRGLOBMF1', 'MAGURAPLEX', 'MAKSONSPIN', 'MALEKSPIN', 'MARICO', 'MATINSPINN', 'MBL1STMF', 'MEGCONMILK', 'MEGHNACEM', 'MEGHNAINS', 'MEGHNALIFE', 'MEGHNAPET', 'MERCANBANK', 'MERCINS', 'METROSPIN', 'MHSML', 'MIDASFIN', 'MIDLANDBNK', 'MIRACLEIND', 'MIRAKHTER', 'MITHUNKNIT', 'MJLBD', 'MLDYEING', 'MONNOAGML', 'MONNOCERA', 'MONNOFABR', 'MONOSPOOL', 'MPETROLEUM', 'MTB', 'NAHEEACP', 'NATLIFEINS', 'NAVANACNG', 'NAVANAPHAR', 'NBL', 'NCCBANK', 'NCCBLMF1', 'NEWLINE', 'NFML', 'NHFIL', 'NITOLINS', 'NORTHERN', 'NORTHRNINS', 'NPOLYMER', 'NRBBANK', 'NRBCBANK', 'NTC', 'NTLTUBES', 'NURANI', 'OAL', 'OIMEX', 'OLYMPIC', 'ONEBANKPLC', 'ORIONINFU', 'ORIONPHARM', 'PADMALIFE', 'PADMAOIL', 'PARAMOUNT', 'PDL', 'PENINSULA', 'PEOPLESINS', 'PF1STMF', 'PHARMAID', 'PHENIXINS', 'PHOENIXFIN', 'PHPMF1', 'PIONEERINS', 'PLFSL', 'POPULAR1MF', 'POPULARLIF', 'POWERGRID', 'PRAGATIINS', 'PRAGATILIF', 'PREMIERBAN', 'PREMIERCEM', 'PREMIERLEA', 'PRIME1ICBA', 'PRIMEBANK', 'PRIMEFIN', 'PRIMEINSUR', 'PRIMELIFE', 'PRIMETEX', 'PROGRESLIF', 'PROVATIINS', 'PTL', 'PUBALIBANK', 'PURABIGEN', 'QUASEMIND', 'QUEENSOUTH', 'RAHIMAFOOD', 'RAHIMTEXT', 'RAKCERAMIC', 'RANFOUNDRY', 'RDFOOD', 'RECKITTBEN', 'REGENTTEX', 'RELIANCE1', 'RELIANCINS', 'RENATA', 'RENWICKJA', 'REPUBLIC', 'RINGSHINE', 'ROBI', 'RSRMSTEEL', 'RUNNERAUTO', 'RUPALIBANK', 'RUPALIINS', 'RUPALILIFE', 'SAFKOSPINN', 'SAIFPOWER', 'SAIHAMCOT', 'SAIHAMTEX', 'SALAMCRST', 'SALVO', 'SAMATALETH', 'SAMORITA', 'SANDHANINS', 'SAPORTL', 'SAVAREFR', 'SBACBANK', 'SEAPEARL', 'SEMLFBSLGF', 'SEMLIBBLSF', 'SHAHJABANK', 'SHARPIND', 'SHASHADNIM', 'SHEPHERD', 'SHURWID', 'SHYAMPSUG', 'SIBL', 'SICL', 'SILCOPHL', 'SILVAPHL', 'SIMTEX', 'SINGERBD', 'SINOBANGLA', 'SIPLC', 'SKTRIMS', 'SONALIANSH', 'SONALILIFE', 'SONALIPAPR', 'SONARBAINS', 'SONARGAON', 'SOUTHEASTB', 'SPCERAMICS', 'SPCL', 'SQUARETEXT', 'SQURPHARMA', 'SSSTEEL', 'STANCERAM', 'STANDARINS', 'STANDBANKL', 'STYLECRAFT', 'SUMITPOWER', 'SUNLIFEINS', 'TAKAFULINS', 'TALLUSPIN', 'TAMIJTEX', 'TECHNODRUG', 'TILIL', 'TITASGAS', 'TOSRIFA', 'TRUSTB1MF', 'TRUSTBANK', 'TUNGHAI', 'UCB', 'UNILEVERCL', 'UNIONBANK', 'UNIONCAP', 'UNIONINS', 'UNIQUEHRL', 'UNITEDFIN', 'UNITEDINS', 'UPGDCL', 'USMANIAGL', 'UTTARABANK', 'UTTARAFIN', 'VAMLBDMF1', 'VAMLRBBF', 'VFSTDL', 'WALTONHIL', 'WATACHEM', 'WMSHIPYARD', 'YPL', 'ZAHEENSPIN', 'ZAHINTEX', 'ZEALBANGLA']
+_FALLBACK_SYMBOLS = ['1JANATAMF','1STPRIMFMF','AAMRANET','AAMRATECH','ABB1STMF','ABBANK','ACFL','ACI','ACIFORMULA','ACMELAB','ACMEPL','ACTIVEFINE','ADNTEL','ADVENT','AFCAGRO','AFTABAUTO','AGNISYSL','AGRANINS','AIBL1STIMF','AIL','AL-HAJTEX','ALARABANK','ALIF','ALLTEX','AMANFEED','AMBEEPHA','AMCL(PRAN)','ANLIMAYARN','ANWARGALV','AOL','APEXFOODS','APEXFOOT','APEXSPINN','APEXTANRY','APOLOISPAT','ARAMIT','ARAMITCEM','ARGONDENIM','ASIAINS','ASIAPACINS','ASIATICLAB','ATLASBANG','AZIZPIPES','BANGAS','BANKASIA','BARKAPOWER','BATASHOE','BATBC','BAYLEASING','BBS','BBSCABLES','BDAUTOCA','BDCOM','BDFINANCE','BDLAMPS','BDSERVICE','BDTHAI','BDTHAIFOOD','BDWELDING','BEACHHATCH','BEACONPHAR','BENGALWTL','BERGERPBL','BESTHLDNG','BEXIMCO','BGIC','BIFC','BNICL','BPML','BPPL','BRACBANK','BSC','BSCPLC','BSRMLTD','BSRMSTEEL','BXPHARMA','CAPITECGBF','CAPMBDBLMF','CAPMIBBLMF','CENTRALINS','CENTRALPHL','CITYBANK','CITYGENINS','CLICL','CNATEX','CONFIDCEM','CONTININS','COPPERTECH','CROWNCEMNT','CRYSTALINS','CVOPRL','DACCADYE','DAFODILCOM','DBH','DBH1STMF','DELTALIFE','DELTASPINN','DESCO','DESHBANDHU','DGIC','DHAKABANK','DHAKAINS','DOMINAGE','DOREENPWR','DSHGARME','DSSL','DULAMIACOT','DUTCHBANGL','EASTERNINS','EASTLAND','EASTRNLUB','EBL','EBL1STMF','EBLNRBMF','ECABLES','EGEN','EHL','EIL','EMERALDOIL','ENVOYTEX','EPGL','ESQUIRENIT','ETL','EXIM1STMF','EXIMBANK','FAMILYTEX','FARCHEM','FAREASTFIN','FAREASTLIF','FASFIN','FBFIF','FEDERALINS','FEKDIL','FINEFOODS','FIRSTFIN','FIRSTSBANK','FORTUNE','FUWANGCER','FUWANGFOOD','GBBPOWER','GEMINISEA','GENEXIL','GENNEXT','GHAIL','GHCL','GIB','GLDNJMF','GLOBALINS','GOLDENSON','GP','GPHISPAT','GQBALLPEN','GRAMEENS2','GREENDELMF','GREENDELT','GSPFINANCE','HAKKANIPUL','HAMI','HEIDELBCEM','HFL','HRTEX','HWAWELLTEX','IBNSINA','IBP','ICB','ICB3RDNRB','ICBAGRANI1','ICBAMCL2ND','ICBEPMF1S1','ICBIBANK','ICBSONALI1','ICICL','IDLC','IFADAUTOS','IFIC','IFIC1STMF','IFILISLMF1','ILFSL','INDEXAGRO','INTECH','INTRACO','IPDC','ISLAMIBANK','ISLAMICFIN','ISLAMIINS','ISNLTD','ITC','JAMUNABANK','JAMUNAOIL','JANATAINS','JHRML','JMISMDL','JUTESPINN','KARNAPHULI','KAY&QUE','KBPPWBIL','KDSALTD','KEYACOSMET','KOHINOOR','KPCL','KPPL','KTL','LANKABAFIN','LEGACYFOOT','LHB','LIBRAINFU','LINDEBD','LOVELLO','LRBDL','LRGLOBMF1','MAGURAPLEX','MAKSONSPIN','MALEKSPIN','MARICO','MATINSPINN','MBL1STMF','MEGCONMILK','MEGHNACEM','MEGHNAINS','MEGHNALIFE','MEGHNAPET','MERCANBANK','MERCINS','METROSPIN','MHSML','MIDASFIN','MIDLANDBNK','MIRACLEIND','MIRAKHTER','MITHUNKNIT','MJLBD','MLDYEING','MONNOAGML','MONNOCERA','MONNOFABR','MONOSPOOL','MPETROLEUM','MTB','NAHEEACP','NATLIFEINS','NAVANACNG','NAVANAPHAR','NBL','NCCBANK','NCCBLMF1','NEWLINE','NFML','NHFIL','NITOLINS','NORTHERN','NORTHRNINS','NPOLYMER','NRBBANK','NRBCBANK','NTC','NTLTUBES','NURANI','OAL','OIMEX','OLYMPIC','ONEBANKPLC','ORIONINFU','ORIONPHARM','PADMALIFE','PADMAOIL','PARAMOUNT','PDL','PENINSULA','PEOPLESINS','PF1STMF','PHARMAID','PHENIXINS','PHOENIXFIN','PHPMF1','PIONEERINS','PLFSL','POPULAR1MF','POPULARLIF','POWERGRID','PRAGATIINS','PRAGATILIF','PREMIERBAN','PREMIERCEM','PREMIERLEA','PRIME1ICBA','PRIMEBANK','PRIMEFIN','PRIMEINSUR','PRIMELIFE','PRIMETEX','PROGRESLIF','PROVATIINS','PTL','PUBALIBANK','PURABIGEN','QUASEMIND','QUEENSOUTH','RAHIMAFOOD','RAHIMTEXT','RAKCERAMIC','RANFOUNDRY','RDFOOD','RECKITTBEN','REGENTTEX','RELIANCE1','RELIANCINS','RENATA','RENWICKJA','REPUBLIC','RINGSHINE','ROBI','RSRMSTEEL','RUNNERAUTO','RUPALIBANK','RUPALIINS','RUPALILIFE','SAFKOSPINN','SAIFPOWER','SAIHAMCOT','SAIHAMTEX','SALAMCRST','SALVO','SAMATALETH','SAMORITA','SANDHANINS','SAPORTL','SAVAREFR','SBACBANK','SEAPEARL','SEMLFBSLGF','SEMLIBBLSF','SHAHJABANK','SHARPIND','SHASHADNIM','SHEPHERD','SHURWID','SHYAMPSUG','SIBL','SICL','SILCOPHL','SILVAPHL','SIMTEX','SINGERBD','SINOBANGLA','SIPLC','SKTRIMS','SONALIANSH','SONALILIFE','SONALIPAPR','SONARBAINS','SONARGAON','SOUTHEASTB','SPCERAMICS','SPCL','SQUARETEXT','SQURPHARMA','SSSTEEL','STANCERAM','STANDARINS','STANDBANKL','STYLECRAFT','SUMITPOWER','SUNLIFEINS','TAKAFULINS','TALLUSPIN','TAMIJTEX','TECHNODRUG','TILIL','TITASGAS','TOSRIFA','TRUSTB1MF','TRUSTBANK','TUNGHAI','UCB','UNILEVERCL','UNIONBANK','UNIONCAP','UNIONINS','UNIQUEHRL','UNITEDFIN','UNITEDINS','UPGDCL','USMANIAGL','UTTARABANK','UTTARAFIN','VAMLBDMF1','VAMLRBBF','VFSTDL','WALTONHIL','WATACHEM','WMSHIPYARD','YPL','ZAHEENSPIN','ZAHINTEX','ZEALBANGLA']
 
-def get_dse_stock_list(force_refresh: bool = False) -> List[str]:
+def get_dse_stock_list(force_refresh=False):
     try:
         if force_refresh: _LIVE_CACHE.refresh_prices()
         syms = _LIVE_CACHE.get_symbols()
         if syms and len(syms) >= 50:
-            filtered = [s for s in syms if s and not s.isdigit() and s not in ("DSEX", "DSES", "DS30", "DGEN")]
+            filtered = [s for s in syms if s and not s.isdigit() and s not in ("DSEX","DSES","DS30","DGEN")]
             if len(filtered) >= 50:
                 print(f"✅ Live API returned {len(filtered)} symbols")
                 return filtered
         print(f"⚠️ Live API returned only {len(syms) if syms else 0} symbols")
     except Exception as e: print(f"⚠️ Live API symbol fetch failed: {e}")
-    print("⚠️ Using fallback symbol list (395 stocks)")
+    print("⚠️ Using fallback symbol list")
     return list(_FALLBACK_SYMBOLS)
 
 # ==================== COMPANY INFO ====================
 _COMPANY_INFO_CACHE = {}; _COMPANY_INFO_LOCK = threading.Lock()
-def parse_company_page(symbol: str) -> Optional[dict]:
+def parse_company_page(symbol):
     sym = symbol.upper().strip()
     with _COMPANY_INFO_LOCK:
         if sym in _COMPANY_INFO_CACHE: return _COMPANY_INFO_CACHE[sym]
@@ -628,12 +580,12 @@ def parse_company_page(symbol: str) -> Optional[dict]:
             res = _BDSHARE_COMPANY_INFO(sym)
             if isinstance(res, pd.DataFrame) and not res.empty:
                 r = res.iloc[0]
-                for key, aliases in {"market_cap": ["market_cap", "market capitalization", "mktcap"], "sector": ["sector", "industry"], "pe_ratio": ["pe_ratio", "p/e", "pe"], "ltp": ["ltp", "last trading price"], "volume": ["volume", "total volume"]}.items():
+                for key, aliases in {"market_cap":["market_cap","market capitalization","mktcap"],"sector":["sector","industry"],"pe_ratio":["pe_ratio","p/e","pe"],"ltp":["ltp","last trading price"],"volume":["volume","total volume"]}.items():
                     for a in aliases:
                         for c in res.columns:
                             if a.lower() in str(c).lower():
                                 v = r[c]
-                                if key in ("market_cap", "pe_ratio", "ltp", "volume"):
+                                if key in ("market_cap","pe_ratio","ltp","volume"):
                                     try: info[key] = float(str(v).replace(",", ""))
                                     except Exception: pass
                                 else: info[key] = str(v)
@@ -644,24 +596,33 @@ def parse_company_page(symbol: str) -> Optional[dict]:
     with _COMPANY_INFO_LOCK: _COMPANY_INFO_CACHE[sym] = info
     return info or None
 
-# ==================== SELF-HEALING CACHE ====================
-def _append_live_snapshot_to_cache(symbol: str, payload: dict) -> None:
+# ==================== SELF-HEALING CACHE (v1.31) ====================
+def _append_live_snapshot_to_cache(symbol, payload):
     if not payload: return
     try:
         price = float(payload.get("close") or payload.get("ltp") or 0)
         if price <= 0: return
-        row = {"date": pd.to_datetime(payload.get("date") or dt.date.today()), "open": float(payload.get("open") or price), "high": float(payload.get("high") or price), "low": float(payload.get("low") or price), "close": price, "volume": int(payload.get("volume") or 0)}
+        row = {"date": pd.to_datetime(payload.get("date") or dt.date.today()),
+               "open": float(payload.get("open") or price), "high": float(payload.get("high") or price),
+               "low": float(payload.get("low") or price), "close": price,
+               "volume": int(payload.get("volume") or 0)}
         cache_file = f"{CACHE_DIR}/{symbol.upper()}_archive.csv"
         if os.path.exists(cache_file):
-            df = pd.read_csv(cache_file); df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date"]); df = df[df["date"].dt.date != row["date"].date()]
+            df = pd.read_csv(cache_file)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            # v1.31: don't overwrite an authoritative EOD row that already has volume
+            existing = df[df["date"].dt.date == row["date"].date()]
+            if not existing.empty and int(existing.iloc[0].get("volume", 0) or 0) > 0:
+                return
+            df = df[df["date"].dt.date != row["date"].date()]
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         else: df = pd.DataFrame([row])
         df.sort_values("date").reset_index(drop=True).to_csv(cache_file, index=False)
     except Exception: pass
 
 # ==================== REALTIME DATA ====================
-def get_realtime_data(symbol: str) -> Optional[dict]:
+def get_realtime_data(symbol):
     symbol = symbol.upper().strip()
     payload = _LIVE_CACHE.get_symbol(symbol)
     if payload and payload.get("ltp", 0) > 0:
@@ -698,7 +659,8 @@ def load_local_data(symbol):
                         for c in df.columns:
                             if col.lower() in c.lower(): df[col] = df[c]; break
                 if 'date' in df.columns and 'close' in df.columns:
-                    df = df.sort_values('date').reset_index(drop=True); df = df[df['date'].notna()]
+                    df = df.sort_values('date').reset_index(drop=True)
+                    df = df[df['date'].notna()]
                     if len(df) >= 20: return df
             except Exception: pass
     return None
@@ -718,12 +680,12 @@ def get_historical_data(symbol, realtime):
     if df is not None and len(df) >= 20:
         df = df.copy(); df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df = df.dropna(subset=['date']); df = df[df['date'].dt.year > 1990]
-        for col in ['open', 'high', 'low', 'close', 'volume']:
+        for col in ['open','high','low','close','volume']:
             if col not in df.columns: df[col] = 0.0
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
         df = df[df['close'] > 0]
         if len(df) >= 20:
-            df = df[['date', 'open', 'high', 'low', 'close', 'volume']].sort_values('date').reset_index(drop=True)
+            df = df[['date','open','high','low','close','volume']].sort_values('date').reset_index(drop=True)
             try: df.to_csv(f"{CACHE_DIR}/{symbol}_archive.csv", index=False)
             except Exception: pass
             try:
@@ -733,8 +695,7 @@ def get_historical_data(symbol, realtime):
     return None
 
 def seed_all_historical_cache():
-    symbols = get_dse_stock_list(force_refresh=True)
-    total = len(symbols)
+    symbols = get_dse_stock_list(force_refresh=True); total = len(symbols)
     print(f"\n📦 Seeding historical cache for {total} symbols...")
     cached = failed = already = 0
     end = dt.date.today(); start = end - timedelta(days=2*365)
@@ -743,8 +704,7 @@ def seed_all_historical_cache():
         cache_file = f"{CACHE_DIR}/{sym}_archive.csv"
         if os.path.exists(cache_file):
             try:
-                if len(pd.read_csv(cache_file)) >= 20:
-                    already += 1; print(f"{sym:12s} ({i:3d}/{total}) ✓ cached"); continue
+                if len(pd.read_csv(cache_file)) >= 20: already += 1; print(f"{sym:12s} ({i:3d}/{total}) ✓ cached"); continue
             except Exception: pass
         try:
             df = _HIST_COLLECTOR.fetch(sym, start_str, end_str)
@@ -756,14 +716,14 @@ def seed_all_historical_cache():
     print(f"\n📦 Seeding complete — cached: {cached}, already: {already}, failed: {failed}")
 
 # ==================== FAILURE CLASSIFIER ====================
-def classify_failure(symbol: str, exception: Optional[Exception] = None) -> Dict[str, str]:
+def classify_failure(symbol, exception=None):
     sym = symbol.upper().strip()
     live = _LIVE_CACHE.get_symbol(sym)
-    if live is None: return {"reason": "SYMBOL_NOT_FOUND", "details": "Not present in /api/live/prices response"}
-    if float(live.get("ltp") or 0) <= 0: return {"reason": "ZERO_PRICE", "details": f"Live ticker exists but ltp={ltp}"}
+    if live is None: return {"reason": "SYMBOL_NOT_FOUND", "details": "Not present in /api/live/prices"}
+    if float(live.get("ltp") or 0) <= 0: return {"reason": "ZERO_PRICE", "details": f"ltp={live.get('ltp')}"}
     hist = load_local_data(sym)
-    if hist is None: return {"reason": "NO_HISTORY_LOCAL", "details": "No cached CSV and history sources returned nothing"}
-    if len(hist) < 20: return {"reason": "INSUFFICIENT_HISTORY", "details": f"Only {len(hist)} rows (need >= 20)"}
+    if hist is None: return {"reason": "NO_HISTORY_LOCAL", "details": "No cached CSV"}
+    if len(hist) < 20: return {"reason": "INSUFFICIENT_HISTORY", "details": f"Only {len(hist)} rows"}
     if exception is not None: return {"reason": "ANALYSIS_ERROR", "details": f"{type(exception).__name__}: {str(exception)[:120]}"}
     return {"reason": "UNKNOWN_ERROR", "details": "Analysis returned None"}
 
@@ -800,7 +760,7 @@ def calculate_macd(data, fast=12, slow=26, signal=9):
     return line, sig, line - sig
 
 # ==================== HIKE-TIER ====================
-def compute_extension_from_sma20(df: pd.DataFrame, price: float) -> Tuple[float, float]:
+def compute_extension_from_sma20(df, price):
     try:
         if df is None or len(df) < 20 or price is None or price <= 0: return 0.0, float(price or 0.0)
         sma20 = float(df['close'].rolling(20).mean().iloc[-1])
@@ -808,7 +768,7 @@ def compute_extension_from_sma20(df: pd.DataFrame, price: float) -> Tuple[float,
         return float((float(price) / sma20 - 1.0) * 100.0), sma20
     except Exception: return 0.0, float(price or 0.0)
 
-def compute_volume_divergence_days(df: pd.DataFrame, lookback: int = VOL_DIVERGENCE_LOOKBACK) -> Tuple[int, int]:
+def compute_volume_divergence_days(df, lookback=VOL_DIVERGENCE_LOOKBACK):
     try:
         if df is None or len(df) < 3: return 0, 0
         n = min(lookback, len(df) - 1); max_run = cur_run = total = 0
@@ -825,7 +785,7 @@ def compute_volume_divergence_days(df: pd.DataFrame, lookback: int = VOL_DIVERGE
 class HikeClassification:
     tier: str; extension_pct: float; volume_divergence_days: int; volume_divergence_total: int; rsi: float
 
-def classify_tier(extension_pct: float, vol_div_days: int, rsi: float = 50.0) -> HikeClassification:
+def classify_tier(extension_pct, vol_div_days, rsi=50.0):
     vd, ext, rsi_v = int(vol_div_days or 0), float(extension_pct or 0.0), float(rsi if rsi is not None else 50.0)
     if vd >= VOL_DIVERGENCE_OVERRIDE or (vd >= VOL_DIVERGENCE_SOFT and rsi_v > VOL_DIVERGENCE_RSI_HOT): tier = TIER_EXHAUSTION
     else:
@@ -836,9 +796,9 @@ def classify_tier(extension_pct: float, vol_div_days: int, rsi: float = 50.0) ->
         else: tier = TIER_EXHAUSTION
     return HikeClassification(tier=tier, extension_pct=ext, volume_divergence_days=vd, volume_divergence_total=0, rsi=rsi_v)
 
-def tier_entry_allowed(tier: str) -> bool: return tier in (TIER_EARLY, TIER_MID)
+def tier_entry_allowed(tier): return tier in (TIER_EARLY, TIER_MID)
 
-# ==================== WYCKOFF ====================
+# ==================== WYCKOFF / RADAR / MCMC ====================
 def get_volume_profile(df, bins=None):
     if len(df) < 20: return {'vpoc': None, 'vah': None, 'val': None}
     pmin, pmax = df['low'].min(), df['high'].max()
@@ -869,12 +829,11 @@ def detect_wyckoff_smc(df, vp=None):
     rh, rl = df['high'].tail(20).max(), df['low'].tail(20).min()
     rp = (rh - rl) / close * 100 if close > 0 else 0
     vpoc = vp.get('vpoc') if vp else None; vah = vp.get('vah') if vp else None; val = vp.get('val') if vp else None
-    if vpoc is None:
-        vpoc = df['close'].rolling(20).mean().iloc[-1]; vah = df['high'].tail(20).max() * 0.98; val = df['low'].tail(20).min() * 1.02
+    if vpoc is None: vpoc = df['close'].rolling(20).mean().iloc[-1]; vah = df['high'].tail(20).max() * 0.98; val = df['low'].tail(20).min() * 1.02
     ab50, ab200 = close > sma50, close > sma200
     inv = val <= close <= vah if val and vah else False
     v20, v50 = df['volume'].tail(20).mean(), df['volume'].tail(50).mean() if len(df) >= 50 else df['volume'].tail(20).mean()
-    vr, vdec = v20 / v50 if v50 > 0 else 1, (v20 / v50 < 1.0 if v50 > 0 else False)
+    vdec = (v20 / v50 < 1.0) if v50 > 0 else False
     lows = df['low'].tail(10).values; hl = all(lows[i] < lows[i+1] for i in range(len(lows)-1)) if len(lows) > 1 else False
     highs = df['high'].tail(10).values; lh = all(highs[i] > highs[i+1] for i in range(len(highs)-1)) if len(highs) > 1 else False
     av = df['volume'].tail(20).mean(); vs = df['volume'].iloc[-1] / av if av > 0 else 1
@@ -896,8 +855,7 @@ def detect_wyckoff_smc(df, vp=None):
 
 def detect_order_flow_signal(df):
     if len(df) < 5: return {'absorption': False, 'initiative': False}
-    last, prev = df.iloc[-1], df.iloc[-2]
-    av, ar = df['volume'].tail(10).mean(), (df['high'] - df['low']).tail(10).mean()
+    last = df.iloc[-1]; av = df['volume'].tail(10).mean(); ar = (df['high'] - df['low']).tail(10).mean()
     abs_ = (last['volume'] > av * 1.5 and (last['high'] - last['low']) < ar * 0.6)
     sa = abs_ and last['close'] > last['open']; ba = abs_ and last['close'] < last['open']
     ini = (last['volume'] > av * 1.3 and (last['high'] - last['low']) > ar * 1.2)
@@ -936,7 +894,6 @@ def get_dynamic_stop(df, price, is_long=True):
     if is_long: return max(max(price - atr*2.0, df['low'].tail(5).min()*0.98 if len(df) >= 5 else price*0.95), price*0.95)
     return min(min(price + atr*2.0, df['high'].tail(5).max()*1.02 if len(df) >= 5 else price*1.05), price*1.05)
 
-# ==================== RADAR ====================
 def compute_radar_score(df, realtime, rsi, adx, macd_hist):
     if df is None or len(df) < 60: return 0, '', 0.0
     score = 0; flags = []
@@ -959,26 +916,28 @@ def compute_radar_score(df, realtime, rsi, adx, macd_hist):
     if turnover >= RADAR_MIN_TURNOVER: score += 1; flags.append('LIQ_OK')
     return score, ','.join(flags), turnover
 
-# ==================== MCMC ====================
 def compute_mcmc(symbol, df, current_price, dsex=None):
+    invalid = {'quality': 'INVALID', 'mu_hat': 0.0, 'mu_hat_raw': 0.0, 'sigma_adapt': 0.02, 'buy_zone': current_price*0.98, 'target': current_price*1.02, 'stop': current_price*0.95, 't_stat': 0.0, 'avg_turnover': 0.0, 'n_eff': 0, 'signal': 'WAIT', 'P_mu': 0.5}
     vd = df[df['volume'] > 0].copy()
-    if len(vd) < 20: return {'quality': 'INVALID', 'mu_hat': 0.0, 'mu_hat_raw': 0.0, 'sigma_adapt': 0.02, 'buy_zone': current_price*0.98, 'target': current_price*1.02, 'stop': current_price*0.95, 't_stat': 0.0, 'avg_turnover': 0.0, 'n_eff': 0, 'signal': 'WAIT', 'P_mu': 0.5}
+    if len(vd) < 20: return invalid
     vd['r'] = np.log(vd['close'] / vd['open']); rs = vd['r'].dropna(); N = len(rs)
-    if N < 5: return {'quality': 'INVALID', 'mu_hat': 0.0, 'mu_hat_raw': 0.0, 'sigma_adapt': 0.02, 'buy_zone': current_price*0.98, 'target': current_price*1.02, 'stop': current_price*0.95, 't_stat': 0.0, 'avg_turnover': 0.0, 'n_eff': 0, 'signal': 'WAIT', 'P_mu': 0.5}
+    if N < 5: return invalid
     if dsex is not None and len(dsex) >= 252:
         dr = np.log(dsex / dsex.shift(1)).dropna()
         mu_0, s0sq = (dr.iloc[-252:].mean(), dr.iloc[-252:].var()) if len(dr) >= 252 else (0.0, 0.01)
     else: mu_0, s0sq = 0.0, 0.01
     Nw = min(60, max(20, N)); rw = rs.iloc[-Nw:] if N >= Nw else rs; neff = len(rw)
-    smsq = rw.var() if neff > 1 else 0.01
-    den = s0sq + (neff * smsq)
+    smsq = rw.var() if neff > 1 else 0.01; den = s0sq + (neff * smsq)
     mu_hat_raw = ((s0sq * mu_0) + (smsq * rw.sum())) / den if den != 0 else 0.0
     mu_hat = (1.0 - PRIOR_SHRINK) * mu_hat_raw + PRIOR_SHRINK * mu_0
     atr14 = calculate_atr(df, 14); atr_ratio = atr14 / current_price if atr14 and current_price > 0 else 0.02
     sig_adapt = max(0.01, atr_ratio * MCMC_SIGMA_PAD)
-    buy_zone = current_price * np.exp(mu_hat + Z_BUY * sig_adapt); target = current_price * np.exp(mu_hat + Z_SELL * sig_adapt); stop = current_price * np.exp(mu_hat + Z_STOP * sig_adapt)
+    buy_zone = current_price * np.exp(mu_hat + Z_BUY * sig_adapt)
+    target = current_price * np.exp(mu_hat + Z_SELL * sig_adapt)
+    stop = current_price * np.exp(mu_hat + Z_STOP * sig_adapt)
     t_stat = mu_hat / (sig_adapt / np.sqrt(neff)) if sig_adapt > 0 else 0.0
-    avg_turn = (df['close'] * df['volume']).tail(20).mean(); quality = 'VALID' if avg_turn > LIQUIDITY_THRESHOLD else 'INVALID'
+    avg_turn = (df['close'] * df['volume']).tail(20).mean()
+    quality = 'VALID' if avg_turn > LIQUIDITY_THRESHOLD else 'INVALID'
     signal = 'WAIT'
     if quality == 'VALID':
         ma20 = float(df['close'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else current_price
@@ -990,7 +949,6 @@ def compute_mcmc(symbol, df, current_price, dsex=None):
     except OverflowError: p_up = 1.0 if t_stat > 0 else 0.0
     return {'quality': quality, 'mu_hat': mu_hat, 'mu_hat_raw': mu_hat_raw, 'sigma_adapt': sig_adapt, 'buy_zone': buy_zone, 'target': target, 'stop': stop, 't_stat': t_stat, 'signal': signal, 'avg_turnover': avg_turn, 'n_eff': neff, 'P_mu': p_up}
 
-# ==================== FORECAST ====================
 def compute_forecast_1w(price, mcmc_mu, mcmc_t_stat, mcmc_sigma, volume_conf, verdict, weinstein_stage2, regime='Sideways', avg_turnover=0.0, a_mqs=0.0, use_simplified=False):
     th = get_forecast_thresholds(regime); T_TRADE, BAND_TRADE, T_WATCH, BAND_WATCH = th['T_TRADE'], th['BAND_TRADE'], th['T_WATCH'], th['BAND_WATCH']
     BS = BAND_WATCH * BAND_SOFT_WATCH_FACTOR; t_sq = mcmc_t_stat ** 2; denom = t_sq + SHRINK_K
@@ -1012,10 +970,10 @@ def compute_forecast_1w(price, mcmc_mu, mcmc_t_stat, mcmc_sigma, volume_conf, ve
         if verdict == 'RED': reason = 'Verdict=RED'
         elif weinstein_stage2 != 'YES': reason = 'Not Stage 2'
         elif bw > BAND_TRADE: reason = f'Band {bw:.1f}% > {BAND_TRADE:.1f}%'
-        elif avg_turnover < LIQ_TRADE_TIER: reason = f'Turnover low'
+        elif avg_turnover < LIQ_TRADE_TIER: reason = 'Turnover low'
         elif mcmc_t_stat < T_TRADE: reason = f't {mcmc_t_stat:.2f} < {T_TRADE}'
         else: reason = 'Conditions not met'
-    elif (mcmc_t_stat >= T_WATCH and weinstein_stage2 == 'YES' and bw <= BS and avg_turnover >= LIQ_WATCH_TIER and a_mqs >= A_MQS_SOFT_WATCH): sig = 'WATCH'; reason = f'Soft WATCH (Stage2+aMQS)'
+    elif (mcmc_t_stat >= T_WATCH and weinstein_stage2 == 'YES' and bw <= BS and avg_turnover >= LIQ_WATCH_TIER and a_mqs >= A_MQS_SOFT_WATCH): sig = 'WATCH'; reason = 'Soft WATCH (Stage2+aMQS)'
     else:
         sig = 'IGNORE'
         if mcmc_t_stat < T_WATCH: reason = f't {mcmc_t_stat:.2f} < {T_WATCH}'
@@ -1023,18 +981,16 @@ def compute_forecast_1w(price, mcmc_mu, mcmc_t_stat, mcmc_sigma, volume_conf, ve
         elif verdict == 'RED': reason = 'Verdict RED'
     return {'mu_shrunk': mu_shrunk, 'r_mid': r_mid, 'r_mid_effective': r_eff, 'sigma_1w': sigma_1w, 'band_80': band_80, 'P_low': P_low, 'P_mid': P_mid, 'P_high': P_high, 'band_width_pct': bw, 'signal': sig, 'reason': reason, 'version': ver}
 
-# ==================== HARD GATE ====================
-def check_hard_gate(adtv20: Optional[float], market_cap_known: bool) -> Tuple[bool, str, float]:
+def check_hard_gate(adtv20, market_cap_known):
     adtv = float(adtv20 or 0.0)
     if adtv < ADTV_HARD_FAIL: return (False, f"Hard gate: ADTV < {ADTV_HARD_FAIL:,}", 0.0)
     if adtv < ADTV_SOFT_WARN: return (True, " ", 0.5)
     return (True, " ", 1.0)
 
-# ==================== FUZZY v3 ====================
 def _default_fuzzy_v3(reason='INVALID'):
-    return {'M': 0.0, 'P': 0.0, 'C': 0.0, 'R': 0.0, 'L': 0.0, 'C_raw': 0.0, 'S_gate': 0.0, 'S_rank': 0.0, 'FinalScore': 0.0, 'Action': 'Avoid', 'ActionBn': '⛔ এড়িয়ে যান', 'Size': 'Cash (0%)', 'Color': 'avoid', 'Reasons': [f'❌ {reason}'], 'turnover_velocity': 0.0, 'hard_gate_pass': False, 'skip_reason': reason, 'size_mult': 0.0, 'th_strong': FUZZY_V3_TH_STRONG_BASE, 'th_mild': FUZZY_V3_TH_MILD_BASE, 'th_watch': FUZZY_V3_TH_WATCH_BASE}
+    return {'M':0.0,'P':0.0,'C':0.0,'R':0.0,'L':0.0,'C_raw':0.0,'S_gate':0.0,'S_rank':0.0,'FinalScore':0.0,'Action':'Avoid','ActionBn':'⛔ এড়িয়ে যান','Size':'Cash (0%)','Color':'avoid','Reasons':[f'❌ {reason}'],'turnover_velocity':0.0,'hard_gate_pass':False,'skip_reason':reason,'size_mult':0.0,'th_strong':FUZZY_V3_TH_STRONG_BASE,'th_mild':FUZZY_V3_TH_MILD_BASE,'th_watch':FUZZY_V3_TH_WATCH_BASE}
 
-def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor, price_vs_ema20, volume_ratio, close_position, rsi, adx, turnover, avg_vol_50, market_cap=0.0, free_float_cap=0.0, adtv20: Optional[float] = None, extension_pct: float = 0.0, vol_div_days: int = 0, hike_tier: str = TIER_NONE):
+def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor, price_vs_ema20, volume_ratio, close_position, rsi, adx, turnover, avg_vol_50, market_cap=0.0, free_float_cap=0.0, adtv20=None, extension_pct=0.0, vol_div_days=0, hike_tier=TIER_NONE):
     def _f(v, default=0.0):
         try:
             if v is None: return default
@@ -1100,8 +1056,8 @@ def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor, price_vs_
     if R >= 0.70: reasons.append('🌊 Favourable regime + breadth')
     if L < 0.50: reasons.append('⚠️ Low relative liquidity')
     if data_missing: reasons.append('ℹ️ Free-float data missing – used fallback')
-    if S_gate < GATE_FLOOR_MILD: reasons.append('⚠️ Gate failed (geometric mean too low)')
-    if size_mult == 0.5: reasons.append(f'⚠️ ADTV soft-warn (< {ADTV_SOFT_WARN:,}) – size ×0.5')
+    if S_gate < GATE_FLOOR_MILD: reasons.append('⚠️ Gate failed')
+    if size_mult == 0.5: reasons.append(f'⚠️ ADTV soft-warn – size ×0.5')
     if hike_tier == TIER_LATE: reasons.append(f'🟠 LATE_HIKE (ext={extension_pct:.1f}%) – size capped')
     elif hike_tier == TIER_MID: reasons.append(f'🟡 MID_HIKE (ext={extension_pct:.1f}%)')
     elif hike_tier == TIER_EARLY: reasons.append(f'🟢 EARLY_SETUP (ext={extension_pct:.1f}%)')
@@ -1109,8 +1065,7 @@ def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor, price_vs_
     if not reasons: reasons.append('➖ Mixed / neutral conditions')
     return {'M': round(M, 4), 'P': round(P, 4), 'C': round(C, 4), 'R': round(R, 4), 'L': round(L, 4), 'C_raw': round(C_raw, 4), 'S_gate': round(S_gate, 4), 'S_rank': round(S_rank, 4), 'FinalScore': round(S_rank, 4), 'Action': action, 'ActionBn': action_bn, 'Size': size, 'Color': color, 'Reasons': reasons, 'turnover_velocity': round(turnover_velocity, 6), 'hard_gate_pass': True, 'skip_reason': '', 'size_mult': size_mult, 'th_strong': round(th_strong, 4), 'th_mild': round(th_mild, 4), 'th_watch': round(th_watch, 4), 'hike_tier': hike_tier, 'extension_pct': round(float(extension_pct or 0.0), 3), 'vol_div_days': int(vol_div_days or 0)}
 
-# ==================== CONSENSUS ====================
-def consensus_signal(gate_pass: bool, data_health: str, final_score: float, canvas_signal: str, hike_tier: str = TIER_NONE, regime: str = 'Sideways') -> str:
+def consensus_signal(gate_pass, data_health, final_score, canvas_signal, hike_tier=TIER_NONE, regime='Sideways'):
     data_stale = (data_health == "STALE")
     if hike_tier == TIER_EXHAUSTION: return "SELL" if canvas_signal in ("SELL", "BUY", "HOLD") else "WAIT"
     if not gate_pass: return "SELL" if canvas_signal == "SELL" else "WAIT"
@@ -1121,45 +1076,7 @@ def consensus_signal(gate_pass: bool, data_health: str, final_score: float, canv
     if final_score >= SCORE_HOLD: return "HOLD"
     return canvas_signal
 
-# ==================== A/B RANKING ====================
-def rank_ab_candidates(reports, equity=120000.0, min_fuzzy=AB_MIN_FUZZY_FOR_RANK):
-    def _f(v, default=0.0):
-        try:
-            if v is None: return default
-            f = float(v)
-            return default if math.isnan(f) or math.isinf(f) else f
-        except (TypeError, ValueError): return default
-    if not isinstance(reports, (list, tuple)) or len(reports) == 0: return []
-    equity = max(1.0, _f(equity, 120000.0)); min_fuzzy = max(0.0, min(1.0, _f(min_fuzzy, AB_MIN_FUZZY_FOR_RANK)))
-    candidates = [r for r in reports if r and getattr(r, 'hike_tier', TIER_NONE) != TIER_EXHAUSTION and _f(getattr(r, 'fuzzy_FinalScore', 0), 0.0) >= min_fuzzy and str(getattr(r, 'ab_variant', 'NONE') or 'NONE').upper() != 'NONE']
-    if not candidates: return []
-    rpd_values = [_f(getattr(r, 'ab_expected_rpd', 0), 0.0) for r in candidates]
-    max_rpd = max(rpd_values) if rpd_values else 1e-9
-    if max_rpd <= 0: max_rpd = 1e-9
-    ranked = []
-    for r in candidates:
-        try:
-            price = max(0.01, _f(getattr(r, 'current_price', 0), 0.01)); rpd = _f(getattr(r, 'ab_expected_rpd', 0), 0.0)
-            conf = _f(getattr(r, 'ab_confidence_score', 0), 0.0); risk = _f(getattr(r, 'ab_risk_per_share', 0), 0.0)
-            fuzzy = _f(getattr(r, 'fuzzy_FinalScore', 0), 0.0); ext = _f(getattr(r, 'extension_pct_from_sma20', 0.0), 0.0)
-            vdiv = int(getattr(r, 'volume_divergence_days', 0) or 0); rr_final = _f(getattr(r, 'reward_risk_final', None), None)
-            if rr_final is None:
-                tp = _f(getattr(r, 'ab_take_profit', 0), price); sl = _f(getattr(r, 'ab_stop_loss', 0), price * 0.95)
-                rr = max(0.0, tp - price) / max(0.01, price - sl)
-            else: rr = rr_final
-            rr_n = max(0.0, min(1.0, rr / 3.0)); rpd_norm = max(0.0, min(1.0, rpd / max_rpd)); conf_n = max(0.0, min(1.0, conf / 100.0))
-            score = (0.40 * rpd_norm + 0.25 * conf_n + 0.20 * rr_n + 0.15 * max(0.0, min(1.0, fuzzy)))
-            if getattr(r, 'hike_tier', TIER_NONE) == TIER_LATE: score *= LATE_RANK_PENALTY
-            if ext > EXTENSION_BAND_LATE: score *= 0.50
-            elif ext > EXTENSION_BAND_MID: score *= 0.80
-            if vdiv >= VOL_DIVERGENCE_SOFT: score *= 0.40
-            elif vdiv >= 1: score *= 0.90
-            ranked.append({'symbol': str(getattr(r, 'symbol', 'UNKNOWN')), 'price': round(price, 2), 'fuzzy': round(fuzzy, 4), 'ab_variant': str(getattr(r, 'ab_variant', 'NONE')), 'expected_rpd': round(rpd, 4), 'confidence': round(conf, 1), 'risk_per_share': round(risk, 2), 'reward_risk': round(rr, 2), 'position_size': int(_f(getattr(r, 'ab_position_size', 0), 0)), 'max_loss': round(_f(getattr(r, 'ab_max_loss', 0), 0), 0), 'rank_score': round(score, 4), 'action': str(getattr(r, 'fuzzy_Action', '')), 'size': str(getattr(r, 'fuzzy_Size', '')), 's_gate': round(_f(getattr(r, 'fuzzy_v3_S_gate', 0), 0), 4), 's_rank': round(_f(getattr(r, 'fuzzy_v3_S_rank', 0), 0), 4), 'L': round(_f(getattr(r, 'fuzzy_v3_L', 0), 0), 4), 'hike_tier': str(getattr(r, 'hike_tier', TIER_NONE)), 'extension_pct': round(ext, 2), 'vol_div_days': vdiv})
-        except Exception: continue
-    ranked.sort(key=lambda x: x['rank_score'], reverse=True)
-    return ranked
-
-# ==================== CANDLESTICK DETECTOR ====================
+# ==================== CANDLE DETECTOR ====================
 class CandleDetector:
     def _b(self, c): return abs(c['close'] - c['open'])
     def _u(self, c): return c['high'] - max(c['open'], c['close'])
@@ -1210,7 +1127,10 @@ class CandleDetector:
         return {'name':'Bearish Harami','direction':'bearish','tier':2} if self._is_bull(p) and self._is_bear(c) and c['open'] < p['close'] and c['close'] > p['open'] else None
     def detect_marubozu(self, df, i):
         c = df.iloc[i]; b, r = self._b(c), self._r(c)
-        return {'name':'White Marubozu','direction':'bullish','tier':1} if r > 0 and b/r > 0.9 and self._is_bull(c) else ({'name':'Black Marubozu','direction':'bearish','tier':1} if r > 0 and b/r > 0.9 else None)
+        if r > 0 and b/r > 0.9:
+            if self._is_bull(c): return {'name':'White Marubozu','direction':'bullish','tier':1}
+            return {'name':'Black Marubozu','direction':'bearish','tier':1}
+        return None
     def detect_morning_star(self, df, i):
         if i < 2: return None
         c1, c2, c3 = df.iloc[i-2], df.iloc[i-1], df.iloc[i]
@@ -1242,13 +1162,60 @@ class CandleDetector:
 # ==================== DATACLASS ====================
 @dataclass
 class StockAnalysisReport:
-    symbol: str; current_price: float; market_cap: float; sector: str; df: pd.DataFrame; realtime_data: Dict; rsi_value: float; adx_value: float; atr_value: float; macd_status: str; final_stop: float; price_targets: Dict; reward_risk_ratio: float
-    reward_risk_final: float = 0.0; avg_daily_volume_50: int = 0; last_day_volume: int = 0; volume_pct_of_avg: float = 0.0; liquidity_pass: bool = False; weekly_aligned: bool = False; a_mqs: float = 0.0; enhancer_count: int = 0; enhancer_pct: float = 0.0; core_filters_pass: bool = False; swing_setup_type: str = ''; market_phase: str = ''; signal_type: str = ''; primary_candle_pattern: str = ''; all_candle_patterns: List[Dict] = field(default_factory=list); cprs: float = 0.0; ab_variant: str = 'NONE'; ab_modifier: float = 0.0; bayesian_pass: bool = False; bayesian_deep: bool = False; buy_zone: float = 0.0; target_zone: float = 0.0; var_stop: float = 0.0; mcmc_signal: str = 'WAIT'; mcmc_mu: float = 0.0; mcmc_mu_raw: float = 0.0; mcmc_sigma: float = 0.0; mcmc_t_stat: float = 0.0; breadth_theta: float = 0.0; momentum_score: int = 0; projection_1w: float = 0.0; canvas_signal: str = 'WAIT'; canvas_reason: str = ''; fc_mu_shrunk: float = 0.0; fc_r_mid: float = 0.0; fc_sigma_1w: float = 0.0; fc_P_low: float = 0.0; fc_P_mid: float = 0.0; fc_P_high: float = 0.0; fc_band_pct: float = 0.0; fc_version: str = 'DRIFT'; forecast_signal: str = 'IGNORE'; forecast_reason: str = ''; verdict: str = 'RED'; weinstein_stage2: bool = False; buy_conditions: Dict = field(default_factory=dict); radar_score: int = 0; radar_flags: str = ''; last_turnover: float = 0.0; fuzzy_P_mu: float = 0.5; fuzzy_P_mu_sigma: float = 0.5; fuzzy_B: float = 0.0; fuzzy_S: float = 0.0; fuzzy_t: float = 0.0; fuzzy_N: int = 0; fuzzy_C_raw: float = 0.0; fuzzy_C_penalty: float = 0.0; fuzzy_C: float = 0.0; fuzzy_P_sigma: float = 0.5; fuzzy_P_DD: float = 0.5; fuzzy_R_raw: float = 1.0; fuzzy_R: float = 1.0; fuzzy_FinalScore: float = 0.0; fuzzy_RegimeDamp: float = 1.0; fuzzy_Action: str = 'Neutral / Hold'; fuzzy_ActionBn: str = '⏳ নিরপেক্ষ / অপেক্ষা'; fuzzy_Size: str = '0%'; fuzzy_Color: str = 'wait'; fuzzy_v3_M: float = 0.0; fuzzy_v3_P: float = 0.0; fuzzy_v3_C: float = 0.0; fuzzy_v3_C_raw: float = 0.0; fuzzy_v3_R: float = 0.0; fuzzy_v3_L: float = 0.0; fuzzy_v3_S_gate: float = 0.0; fuzzy_v3_S_rank: float = 0.0; fuzzy_v3_turnover_velocity: float = 0.0; fuzzy_v3_Reasons: str = ''; fuzzy_v3_hard_gate_pass: bool = False; fuzzy_v3_skip_reason: str = ''; fuzzy_v3_th_strong: float = 0.60; fuzzy_v3_th_mild: float = 0.45; fuzzy_v3_th_watch: float = 0.30; extension_pct_from_sma20: float = 0.0; sma20_value: float = 0.0; volume_divergence_days: int = 0; volume_divergence_total: int = 0; hike_tier: str = TIER_NONE; hike_tier_entry_allowed: bool = False; ab_rpd_a: float = 0.0; ab_rpd_b: float = 0.0; ab_selected_variant: str = 'NONE'; ab_position_size: int = 0; ab_max_loss: float = 0.0; ab_risk_per_share: float = 0.0; ab_entry_price: float = 0.0; ab_stop_loss: float = 0.0; ab_take_profit: float = 0.0; ab_max_holding_days: int = 0; ab_expected_rpd: float = 0.0; ab_confidence_score: float = 0.0; ab_rank_score: float = 0.0; sme_catcher_level: str = 'NONE'; sme_l_score: float = 0.0; sme_volume_ratio: float = 0.0; sme_price_vs_ema20: float = 0.0; sme_ema20_rising: bool = False; sme_close_position: float = 0.0; sme_relative_strength: bool = False; sme_entry_type: str = 'NONE'; sme_position_size_pct: float = 0.0; sme_liquidity_multiplier: float = 0.0; sme_market_cap_missing: bool = False; sme_emergency_floor_ok: bool = False; sme_adtv_20: float = 0.0; sme_free_float_est: float = 0.0; sme_data_health: str = 'OK'; sme_ignition: bool = False; final_score: float = 0.0; final_signal: str = 'WAIT'; asset_class: str = 'EQ'
+    symbol: str; current_price: float; market_cap: float; sector: str; df: pd.DataFrame; realtime_data: Dict
+    rsi_value: float; adx_value: float; atr_value: float; macd_status: str; final_stop: float
+    price_targets: Dict; reward_risk_ratio: float
+    reward_risk_final: float = 0.0; avg_daily_volume_50: int = 0; last_day_volume: int = 0
+    volume_pct_of_avg: float = 0.0; liquidity_pass: bool = False; weekly_aligned: bool = False
+    a_mqs: float = 0.0; enhancer_count: int = 0; enhancer_pct: float = 0.0
+    core_filters_pass: bool = False; swing_setup_type: str = ''; market_phase: str = ''
+    signal_type: str = ''; primary_candle_pattern: str = ''
+    all_candle_patterns: List[Dict] = field(default_factory=list)
+    cprs: float = 0.0; ab_variant: str = 'NONE'; ab_modifier: float = 0.0
+    bayesian_pass: bool = False; bayesian_deep: bool = False
+    buy_zone: float = 0.0; target_zone: float = 0.0; var_stop: float = 0.0
+    mcmc_signal: str = 'WAIT'; mcmc_mu: float = 0.0; mcmc_mu_raw: float = 0.0
+    mcmc_sigma: float = 0.0; mcmc_t_stat: float = 0.0; breadth_theta: float = 0.0
+    momentum_score: int = 0; projection_1w: float = 0.0; canvas_signal: str = 'WAIT'
+    canvas_reason: str = ''; fc_mu_shrunk: float = 0.0; fc_r_mid: float = 0.0
+    fc_sigma_1w: float = 0.0; fc_P_low: float = 0.0; fc_P_mid: float = 0.0; fc_P_high: float = 0.0
+    fc_band_pct: float = 0.0; fc_version: str = 'DRIFT'; forecast_signal: str = 'IGNORE'
+    forecast_reason: str = ''; verdict: str = 'RED'; weinstein_stage2: bool = False
+    buy_conditions: Dict = field(default_factory=dict); radar_score: int = 0
+    radar_flags: str = ''; last_turnover: float = 0.0
+    fuzzy_P_mu: float = 0.5; fuzzy_P_mu_sigma: float = 0.5; fuzzy_B: float = 0.0
+    fuzzy_S: float = 0.0; fuzzy_t: float = 0.0; fuzzy_N: int = 0; fuzzy_C_raw: float = 0.0
+    fuzzy_C_penalty: float = 0.0; fuzzy_C: float = 0.0; fuzzy_P_sigma: float = 0.5
+    fuzzy_P_DD: float = 0.5; fuzzy_R_raw: float = 1.0; fuzzy_R: float = 1.0
+    fuzzy_FinalScore: float = 0.0; fuzzy_RegimeDamp: float = 1.0
+    fuzzy_Action: str = 'Neutral / Hold'; fuzzy_ActionBn: str = '⏳ নিরপেক্ষ / অপেক্ষা'
+    fuzzy_Size: str = '0%'; fuzzy_Color: str = 'wait'
+    fuzzy_v3_M: float = 0.0; fuzzy_v3_P: float = 0.0; fuzzy_v3_C: float = 0.0
+    fuzzy_v3_C_raw: float = 0.0; fuzzy_v3_R: float = 0.0; fuzzy_v3_L: float = 0.0
+    fuzzy_v3_S_gate: float = 0.0; fuzzy_v3_S_rank: float = 0.0
+    fuzzy_v3_turnover_velocity: float = 0.0; fuzzy_v3_Reasons: str = ''
+    fuzzy_v3_hard_gate_pass: bool = False; fuzzy_v3_skip_reason: str = ''
+    fuzzy_v3_th_strong: float = 0.60; fuzzy_v3_th_mild: float = 0.45; fuzzy_v3_th_watch: float = 0.30
+    extension_pct_from_sma20: float = 0.0; sma20_value: float = 0.0
+    volume_divergence_days: int = 0; volume_divergence_total: int = 0
+    hike_tier: str = TIER_NONE; hike_tier_entry_allowed: bool = False
+    ab_rpd_a: float = 0.0; ab_rpd_b: float = 0.0; ab_selected_variant: str = 'NONE'
+    ab_position_size: int = 0; ab_max_loss: float = 0.0; ab_risk_per_share: float = 0.0
+    ab_entry_price: float = 0.0; ab_stop_loss: float = 0.0; ab_take_profit: float = 0.0
+    ab_max_holding_days: int = 0; ab_expected_rpd: float = 0.0
+    ab_confidence_score: float = 0.0; ab_rank_score: float = 0.0
+    sme_catcher_level: str = 'NONE'; sme_l_score: float = 0.0; sme_volume_ratio: float = 0.0
+    sme_price_vs_ema20: float = 0.0; sme_ema20_rising: bool = False; sme_close_position: float = 0.0
+    sme_relative_strength: bool = False; sme_entry_type: str = 'NONE'; sme_position_size_pct: float = 0.0
+    sme_liquidity_multiplier: float = 0.0; sme_market_cap_missing: bool = False
+    sme_emergency_floor_ok: bool = False; sme_adtv_20: float = 0.0; sme_free_float_est: float = 0.0
+    sme_data_health: str = 'OK'; sme_ignition: bool = False
+    final_score: float = 0.0; final_signal: str = 'WAIT'; asset_class: str = 'EQ'
 
-# ==================== ANALYZE ONE STOCK ====================
-def _classify_asset(symbol: str) -> str:
+# ==================== ANALYSIS ====================
+def _classify_asset(symbol):
     s = (symbol or " ").upper()
-    return "MF" if any(tag in s for tag in ("MUTUAL", "1STMF", "2NDMF", "3RDNRB", "1STICB", "GROWTH", "GREEN", "GREENMF", "POPULAR1", "TRUSTB1", "PRIME1ICBA", "LRGLOBMF", "IFILISLMF", "IFIC1STMF", "ICBEPMF", "ICBAMCL", "ICBAGRANI", "ICBSONALI", "PHPMF1", "MBL1STMF", "NCCBLMF", "EBLNRBMF", "EBL1STMF", "DBH1STMF", "EXIM1STMF", "ABB1STMF", "AIBL1STIMF", "PF1STMF", "CSE1STMF")) else "EQ"
+    return "MF" if any(tag in s for tag in ("MUTUAL","1STMF","2NDMF","3RDNRB","1STICB","GROWTH","GREEN","GREENMF","POPULAR1","TRUSTB1","PRIME1ICBA","LRGLOBMF","IFILISLMF","IFIC1STMF","ICBEPMF","ICBAMCL","ICBAGRANI","ICBSONALI","PHPMF1","MBL1STMF","NCCBLMF","EBLNRBMF","EBL1STMF","DBH1STMF","EXIM1STMF","ABB1STMF","AIBL1STIMF","PF1STMF","CSE1STMF")) else "EQ"
 
 def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_factor=1.0, regime_name='NEUTRAL', vol_label='Low', account_equity=1000000.0, ab_mode='LONG'):
     realtime = get_realtime_data(symbol)
@@ -1256,28 +1223,25 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     df = get_historical_data(symbol, realtime)
     if df is None or df.empty: return None
 
-    if 'RSI_14' not in df.columns or 'ADX' not in df.columns:
-        delta = df['close'].diff(); gain = delta.where(delta > 0, 0); loss = -delta.where(delta < 0, 0)
-        ag = gain.ewm(alpha=1/14, adjust=False).mean(); al = loss.ewm(alpha=1/14, adjust=False).mean()
-        rs = ag / (al + 1e-9); df['RSI_14'] = 100 - (100/(1+rs))
-        high, low, close = df['high'], df['low'], df['close']
-        tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-        atr_s = tr.rolling(14, min_periods=1).mean()
-        pdm = high.diff(); mdm = low.diff(); pdm[pdm < 0] = 0; mdm[mdm > 0] = 0
-        mdm = mdm.abs(); pdm[pdm < mdm] = 0
-        pdi = 100 * (pdm.rolling(14, min_periods=1).mean() / (atr_s + 1e-9)); mdi = 100 * (mdm.rolling(14, min_periods=1).mean() / (atr_s + 1e-9))
-        dx = (pdi - mdi).abs() / (pdi + mdi + 1e-9) * 100; df['ADX'] = dx.rolling(14, min_periods=1).mean()
-
     current_price = float(realtime.get('close', df['close'].iloc[-1]))
     if current_price <= 0: current_price = float(df['close'].iloc[-1])
 
     rsi = calculate_rsi(df['close']); adx = calculate_adx(df); atr = calculate_atr(df)
-    _, _, macd_hist = calculate_macd(df['close']); macd_status = "Bullish Cross" if float(macd_hist.iloc[-1]) > 0 else "Bearish Cross"
-    live_vol = float(realtime.get('volume', 0) or 0); projected_vol, _ = project_full_day_volume(live_vol)
+    _, _, macd_hist = calculate_macd(df['close'])
+    macd_status = "Bullish Cross" if float(macd_hist.iloc[-1]) > 0 else "Bearish Cross"
+
+    live_vol = float(realtime.get('volume', 0) or 0)
+    projected_vol, projection_mode = project_full_day_volume(live_vol)
     vol20 = float(df['volume'].tail(20).mean()) if len(df) >= 20 else 0.0
     avg_vol_50 = int(df['volume'].tail(50).mean()) if len(df) >= 50 else int(vol20)
-    volume_pct_of_avg = projected_vol / avg_vol_50 if avg_vol_50 > 0 else 1.0
-    sme_volume_ratio = projected_vol / vol20 if vol20 > 0 else 0.0
+
+    # v1.31: weekend / closed handling
+    if projection_mode in ('OK', 'EARLY'):
+        volume_pct_of_avg = projected_vol / avg_vol_50 if avg_vol_50 > 0 else 1.0
+        sme_volume_ratio = projected_vol / vol20 if vol20 > 0 else 0.0
+    else:
+        volume_pct_of_avg = 1.0
+        sme_volume_ratio = 1.0
 
     radar_score, radar_flags, last_turnover = compute_radar_score(df, realtime, rsi, adx, macd_hist)
     vp = get_volume_profile(df); phase = detect_wyckoff_smc(df, vp)
@@ -1293,8 +1257,10 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
 
     weekly_aligned = False
     if len(df) >= 30:
-        weekly = df.resample('W-FRI', on='date').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
-        if len(weekly) >= 10: weekly_aligned = weekly['close'].iloc[-1] > weekly['close'].ewm(span=20).mean().iloc[-1]
+        try:
+            weekly = df.resample('W-FRI', on='date').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+            if len(weekly) >= 10: weekly_aligned = weekly['close'].iloc[-1] > weekly['close'].ewm(span=20).mean().iloc[-1]
+        except Exception: pass
 
     green_days = (df['close'].diff() > 0).tail(90).sum() / min(90, len(df))
     ag_ = df['close'].diff().where(df['close'].diff() > 0, 0).rolling(14).mean().iloc[-1]
@@ -1314,7 +1280,8 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     ema20_s = df['close'].ewm(span=20, adjust=False).mean()
     ema20_cur = float(ema20_s.iloc[-1]) if len(ema20_s) else current_price
     ema20_prv = float(ema20_s.iloc[-6]) if len(ema20_s) >= 6 else ema20_cur
-    sme_ema20_rising = bool(ema20_cur > ema20_prv); price_vs_ema20 = (current_price / ema20_cur - 1) * 100 if ema20_cur > 0 else 0.0
+    sme_ema20_rising = bool(ema20_cur > ema20_prv)
+    price_vs_ema20 = (current_price / ema20_cur - 1) * 100 if ema20_cur > 0 else 0.0
 
     market_cap = realtime.get('market_cap', 0) or 0
     adtv_20 = float((df['close'] * df['volume']).tail(20).mean()) if len(df) >= 20 else 0.0
@@ -1337,7 +1304,7 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     emergency_floor_ok = bool(adtv_20 >= SME_ADTV_MIN and free_float_est >= SME_FREE_FLOAT_MIN and (market_cap >= SME_MARKET_CAP_MIN or market_cap_missing))
     volume_ok = bool(sme_volume_ratio >= SME_VOLUME_MULT); trend_ok = bool(price_vs_ema20 >= -SME_PRICE_VS_EMA20_PCT)
     day_high_safe = day_high if day_high > 0 else current_price * 1.001
-    ignition = bool(sme_volume_ratio >= 2.0 and close_position >= 0.70 and current_price >= day_high_safe * 0.99)
+    ignition = bool(projection_mode in ('OK', 'EARLY') and sme_volume_ratio >= 2.0 and close_position >= 0.70 and current_price >= day_high_safe * 0.99)
 
     core_catcher = bool(l_score >= SME_L_SCORE_MIN and emergency_floor_ok and ((volume_ok and trend_ok) or ignition))
     strong_momentum = bool(current_price > ema20_cur and sme_ema20_rising and close_position >= SME_CLOSE_POSITION_MIN)
@@ -1574,7 +1541,7 @@ def _bn_reasons(r):
     if r.canvas_signal == 'SELL' and r.canvas_reason: rs.append(f'কারণ: {r.canvas_reason}')
     if r.canvas_signal == 'SELL': rs.append('দাম নিচের দিকে ঝুঁকছে — সাবধান')
     if r.canvas_signal == 'WAIT': rs.append('এখনো স্পষ্ট সংকেত নেই')
-    if r.sme_data_health not in ('OK', 'LIVE', 'FRESH'): rs.append(f'⚠️ তথ্যের মান: {r.sme_data_health}')
+    if r.sme_data_health not in ('OK','LIVE','FRESH'): rs.append(f'⚠️ তথ্যের মান: {r.sme_data_health}')
     tier_label, _ = TIER_BN.get(getattr(r, 'hike_tier', TIER_NONE), ('', ''))
     if tier_label: rs.append(f'🥾 হাইক স্তর: {tier_label} (ext={r.extension_pct_from_sma20:.1f}%)')
     if r.volume_divergence_days >= VOL_DIVERGENCE_OVERRIDE: rs.append(f'📉 {r.volume_divergence_days} দিন ভলিউম-ডাইভারজেন্স — DISTRIBUTION')
@@ -1593,14 +1560,1005 @@ def report_to_bangla_dict(r, dts):
     tier_label, tier_cls = TIER_BN.get(getattr(r, 'hike_tier', TIER_NONE), ('', ''))
     return {'symbol':str(r.symbol),'price':safe_float(price,2),'proj':safe_float(proj,2),'projDiff':safe_float(pd_,1),'projArrow':str(arrow),'recText':str(rt),'recClass':str(rc),'trend':str(_bn_trend(r)),'rsiText':str(_bn_rsi(r.rsi_value)),'verdictText':str(_bn_verdict(r.verdict)),'reasons':list(reasons),'flags':list(fl),'buyZone':safe_float(r.buy_zone or price,2),'target':safe_float(r.target_zone or price*1.05,2),'stop':safe_float(r.var_stop or price*0.95,2),'radarScore':safe_int(r.radar_score),'canvasSignal':str(r.canvas_signal),'canvasReason':str(r.canvas_reason),'hasIgnition':bool('VOL_IGNITION' in (r.radar_flags or '')),'verdict':str(r.verdict),'fuzzyAction':str(r.fuzzy_ActionBn),'fuzzyActionEn':str(r.fuzzy_Action),'fuzzyFinal':safe_float(r.fuzzy_FinalScore,3),'fuzzyColor':str(r.fuzzy_Color),'fuzzySize':str(r.fuzzy_Size),'dataHealth':str(r.sme_data_health),'smeIgnition':bool(r.sme_ignition),'fuzzyV3Reasons':v3_reasons,'finalScore': safe_float(r.final_score, 4),'finalSignal': str(r.final_signal),'assetClass': str(r.asset_class),'fuzzyCRaw': safe_float(r.fuzzy_v3_C_raw, 4),'hikeTier': str(getattr(r, 'hike_tier', TIER_NONE)),'hikeTierBn': str(tier_label), 'hikeTierCls': str(tier_cls),'extensionPct': safe_float(getattr(r, 'extension_pct_from_sma20', 0.0), 2),'sma20': safe_float(getattr(r, 'sma20_value', 0.0), 2),'volDivDays': safe_int(getattr(r, 'volume_divergence_days', 0)),'volDivTotal': safe_int(getattr(r, 'volume_divergence_total', 0)),'tierEntryAllowed': bool(getattr(r, 'hike_tier_entry_allowed', False)),'rrPrelim': safe_float(getattr(r, 'reward_risk_ratio', 0.0), 2),'rrFinal': safe_float(getattr(r, 'reward_risk_final', 0.0), 2)}
 
-# ==================== HTML GENERATOR (abridged) ====================
+# ==================== HTML GENERATOR (FULL — v1.31) ====================
 def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0, ab_mode='LONG'):
-    # NOTE: Full HTML generator is unchanged from v1.28. Paste it here from your v1.28 file.
-    # The function signature and logic are identical.
     try:
         dto = dt.datetime.strptime(timestamp, '%Y%m%d_%H%M'); dts = dto.strftime('%d-%m-%Y, %H:%M')
     except Exception: dts = timestamp
-    html = f"<html><body><h1>Report {dts}</h1><p>Total: {len(reports)}</p></body></html>"
+
+    def ab_vn(v): return {'A':('মোমেন্টাম কৌশল','a'),'B':('ভ্যালু কৌশল','b'),'SPLIT':('৫০/৫০','split')}.get(v, ('কোনো কৌশল নেই','none'))
+    def ab_an(v, a, b):
+        if v == 'A': return f'মোমেন্টাম কৌশল বেছে নিন (RPD: {a:.4f})'
+        if v == 'B': return f'ভ্যালু কৌশল বেছে নিন (RPD: {b:.4f})'
+        if v == 'SPLIT': return 'দুই কৌশলেই অর্ধেক বিনিয়োগ'
+        return 'এখন কোনো ট্রেড নেবেন না'
+    def fz_bn(a): return {'Strong Buy':('🟢🟢 দৃঢ় ক্রয়','buy-strong'),'Mild Buy':('🟢 মৃদু ক্রয়','buy-mild'),'Neutral / Watch':('⏳ নিরপেক্ষ / অপেক্ষা','neutral'),'Avoid':('🔴 এড়িয়ে যান','sell-strong')}.get(a, ('❔ অজানা','neutral'))
+    def fz_sz(a): return {'Strong Buy':'সর্বোচ্চ মূলধন (৮-১০%)','Mild Buy':'অর্ধেক (৪-৫%)','Neutral / Watch':'নগদ / কোনো ট্রেড নয় (০%)','Avoid':'নগদ / কোনো ট্রেড নয় (০%)'}.get(a, 'স্পষ্ট নয়')
+    def fz_rs(r):
+        rs = []
+        if r.fuzzy_v3_M >= 0.6: rs.append('📈 শক্তিশালী মোমেন্টাম')
+        elif r.fuzzy_v3_M <= 0.3: rs.append('📉 দুর্বল মোমেন্টাম')
+        if r.fuzzy_v3_P >= 0.6: rs.append('🕯️ বুলিশ প্যাটার্ন / প্রাইস অ্যাকশন')
+        if r.fuzzy_v3_C >= 0.6: rs.append('✅ MCMC আত্মবিশ্বাস বেশি')
+        elif r.fuzzy_v3_C < 0.3: rs.append('⚠️ MCMC আত্মবিশ্বাস কম')
+        if r.fuzzy_v3_R >= 0.7: rs.append('🌊 অনুকূল বাজার অবস্থা')
+        elif r.fuzzy_v3_R < 0.4: rs.append('🔥 প্রতিকূল বাজার')
+        if r.fuzzy_v3_L < 0.5: rs.append('⚠️ তারল্য তুলনামূলক কম')
+        if not r.fuzzy_v3_hard_gate_pass: rs.append(f'⛔ হার্ড গেট: {r.fuzzy_v3_skip_reason}')
+        else: rs.append(f'✅ হার্ড গেট পাস (TV={r.fuzzy_v3_turnover_velocity:.5f})')
+        if getattr(r, 'hike_tier', TIER_NONE) == TIER_EXHAUSTION: rs.append(f'🔴 EXHAUSTION_WATCH — ext={r.extension_pct_from_sma20:.1f}%, vol_div={r.volume_divergence_days}d')
+        elif getattr(r, 'hike_tier', TIER_NONE) == TIER_LATE: rs.append(f'🟠 LATE_HIKE — ext={r.extension_pct_from_sma20:.1f}% (সাইজ ক্যাপ)')
+        return rs
+    def sme_c(l): return {'STRONG':('🔥 শক্তিশালী সন্ধান','strong'),'CORE':('✅ মূল সন্ধান','core'),'NONE':('⏭️ এড়িয়ে যান','none')}.get(l, ('❔ অজানা','none'))
+    def sme_e(e): return {'Breakout':'🚀 ব্রেকআউট (ভাঙার মুহূর্ত)','Pullback':'📉 পুলব্যাক (পিছু হটা) - সবচেয়ে পছন্দের','Continuation':'➡️ কন্টিনিউয়েশন (চলমান)','None':'⏭️ প্রবেশ নেই'}.get(e, e)
+    def sme_v(v):
+        try: v = float(v)
+        except Exception: v = 0.0
+        if v >= 2.0: return '🔥🔥 খুব বেশি'
+        if v >= 1.5: return '🔥 বেশি'
+        if v >= 1.2: return '✅ স্বাভাবিকের চেয়ে বেশি'
+        if v >= 0.8: return '➖ স্বাভাবিক'
+        return '📉 কম'
+    def sme_l(l):
+        try: l = float(l)
+        except Exception: l = 0.0
+        if l >= 0.7: return '🟢 চমৎকার'
+        if l >= 0.5: return '🟡 ভালো'
+        if l >= 0.3: return '🟠 গ্রহণযোগ্য'
+        return '🔴 দুর্বল'
+    def sme_p(pct, c):
+        try: pct = float(pct)
+        except Exception: pct = 0.0
+        if c == 'NONE': return '⏭️ এড়িয়ে যান (০%)'
+        if pct >= 12: return f'💰 বড় বিনিয়োগ ({pct:.0f}%)'
+        if pct >= 5: return f'💰 মাঝারি বিনিয়োগ ({pct:.0f}%)'
+        if pct > 0: return f'💰 ছোট বিনিয়োগ ({pct:.0f}%)'
+        return '❌ বিনিয়োগ নেই'
+
+    max_rpd_batch = max([max(r.ab_rpd_a or 0, r.ab_rpd_b or 0) for r in reports] or [1e-9])
+    if max_rpd_batch <= 0: max_rpd_batch = 1e-9
+
+    sp_data = []
+    for r in reports:
+        vb, vc = ab_vn(r.ab_selected_variant); ab_act = ab_an(r.ab_selected_variant, r.ab_rpd_a, r.ab_rpd_b)
+        fzab, fzac = fz_bn(r.fuzzy_Action); fzsb = fz_sz(r.fuzzy_Action); fzrs = fz_rs(r)
+        cb, cc = sme_c(r.sme_catcher_level); eb = sme_e(r.sme_entry_type)
+        lbn = sme_l(r.sme_l_score); pbn = sme_p(r.sme_position_size_pct, r.sme_catcher_level); vbn = sme_v(r.sme_volume_ratio)
+        rt, rc = _bn_sig(r.canvas_signal); price = float(r.current_price); proj = float(r.projection_1w or price)
+        pd_ = ((proj - price) / price * 100.0) if price > 0 else 0.0; arrow = '▲' if pd_ > 0.3 else '▼' if pd_ < -0.3 else '▬'
+        try: ls = float(r.sme_l_score)
+        except Exception: ls = 0.0
+        if r.sme_catcher_level == 'STRONG': sme_ps = 0.7 + ls * 0.3
+        elif r.sme_catcher_level == 'CORE': sme_ps = 0.4 + ls * 0.3
+        else: sme_ps = 0.0
+        ab_ps = (r.ab_rpd_a * 0.4 + r.ab_rpd_b * 0.4 + (r.ab_confidence_score or 0) / 100.0 * 0.2) if (r.ab_rpd_a + r.ab_rpd_b) > 0 else 0
+        fz_ps = (abs(r.fuzzy_v3_S_rank) * ((r.fuzzy_v3_C + r.fuzzy_v3_R) / 2.0) if r.fuzzy_v3_C > 0 else 0)
+        flags = [f for f in (r.radar_flags or '').split(',') if f]
+        fl = [_bn_radar(f) for f in flags] or ['এখন বিশেষ কোনো ইঙ্গিত পাওয়া যায়নি।']
+        reasons = _bn_reasons(r)
+        rpd_max = max(r.ab_rpd_a or 0, r.ab_rpd_b or 0, 1e-9); rpd_norm = min(1.0, rpd_max / max_rpd_batch)
+        conf_n = max(0.0, min(1.0, (r.ab_confidence_score or 0) / 100.0))
+        tp = r.ab_take_profit or price; sl = r.ab_stop_loss or (price * 0.95)
+        rr_v = max(0.0, tp - price) / max(0.01, price - sl); rr_n = max(0.0, min(1.0, rr_v / 3.0))
+        fuzzy_n = max(0.0, min(1.0, r.fuzzy_v3_S_rank or 0.0))
+        rank_score = 0.40 * rpd_norm + 0.25 * conf_n + 0.20 * rr_n + 0.15 * fuzzy_n
+        tier_label, tier_cls = TIER_BN.get(getattr(r, 'hike_tier', TIER_NONE), ('', ''))
+        sp_data.append({'symbol': str(r.symbol),'price': safe_float(price, 2),'proj': safe_float(proj, 2),'projDiff': safe_float(pd_, 1),'projArrow': str(arrow),'canvasSignal': str(r.canvas_signal),'recText': str(rt),'recClass': str(rc),'canvasReason': str(r.canvas_reason),'verdict': str(r.verdict),'verdictText': str(_bn_verdict(r.verdict)),'radarScore': safe_int(r.radar_score),'radarFlags': str(r.radar_flags),'radarFlagLines': list(fl),'hasIgnition': bool('VOL_IGNITION' in (r.radar_flags or '')),'buyZone': safe_float(r.buy_zone or price, 2),'target': safe_float(r.target_zone or price * 1.05, 2),'stop': safe_float(r.var_stop or price * 0.95, 2),'trend': str(_bn_trend(r)),'rsiText': str(_bn_rsi(r.rsi_value)),'rsi': safe_float(r.rsi_value, 1),'adx': safe_float(r.adx_value, 1),'aMQS': safe_float(r.a_mqs, 3),'reasons': list(reasons),'abVariant': str(r.ab_selected_variant),'abVariantBn': str(vb),'abVariantCls': str(vc),'abActionBn': str(ab_act),'abRpdA': safe_float(r.ab_rpd_a, 4),'abRpdB': safe_float(r.ab_rpd_b, 4),'abExpectedRpd': safe_float(r.ab_expected_rpd, 4),'abPositionSize': safe_int(r.ab_position_size),'abEntryPrice': safe_float(r.ab_entry_price, 2),'abStopLoss': safe_float(r.ab_stop_loss, 2),'abTakeProfit': safe_float(r.ab_take_profit, 2),'abMaxHoldingDays': safe_int(r.ab_max_holding_days),'abConfidence': safe_float(r.ab_confidence_score, 1),'abProductScore': safe_float(ab_ps, 4),'abMaxLoss': safe_float(r.ab_max_loss, 2),'abRiskPerShare': safe_float(r.ab_risk_per_share, 2),'abRankScore': safe_float(rank_score, 4),'abRewardRisk': safe_float(rr_v, 2),'fuzzyAction': str(r.fuzzy_ActionBn),'fuzzyActionEn': str(r.fuzzy_Action),'fuzzyActionCls': str(fzac),'fuzzyS': safe_float(r.fuzzy_v3_S_rank, 4),'fuzzySGate': safe_float(r.fuzzy_v3_S_gate, 4),'fuzzySRank': safe_float(r.fuzzy_v3_S_rank, 4),'fuzzyM': safe_float(r.fuzzy_v3_M, 4),'fuzzyP': safe_float(r.fuzzy_v3_P, 4),'fuzzyC': safe_float(r.fuzzy_v3_C, 4),'fuzzyCRaw': safe_float(r.fuzzy_v3_C_raw, 4),'fuzzyR': safe_float(r.fuzzy_v3_R, 4),'fuzzyL': safe_float(r.fuzzy_v3_L, 4),'fuzzyTV': safe_float(r.fuzzy_v3_turnover_velocity, 6),'fuzzyGatePass': safe_bool(r.fuzzy_v3_hard_gate_pass),'fuzzySkip': str(r.fuzzy_v3_skip_reason),'fuzzyThStrong': safe_float(r.fuzzy_v3_th_strong, 4),'fuzzyThMild': safe_float(r.fuzzy_v3_th_mild, 4),'fuzzyThWatch': safe_float(r.fuzzy_v3_th_watch, 4),'fuzzySizeBn': str(fzsb),'fuzzyColor': str(r.fuzzy_Color),'fuzzyReasons': list(fzrs),'fuzzyProductScore': safe_float(fz_ps, 4),'smeCatcherLevel': str(r.sme_catcher_level),'smeCatcherBn': str(cb),'smeCatcherCls': str(cc),'smeEntryType': str(r.sme_entry_type),'smeEntryBn': str(eb),'smeLScore': safe_float(r.sme_l_score, 3),'smeLScoreBn': str(lbn),'smePositionSizePct': safe_float(r.sme_position_size_pct, 1),'smePositionBn': str(pbn),'smeVolumeRatio': safe_float(r.sme_volume_ratio, 3),'smeVolumeBn': str(vbn),'smePriceVsEma20': safe_float(r.sme_price_vs_ema20, 3),'smeMarketCapMissing': safe_bool(r.sme_market_cap_missing),'smeProductScore': safe_float(sme_ps, 4),'finalScore': safe_float(r.final_score, 4),'finalSignal': str(r.final_signal),'assetClass': str(r.asset_class),'hikeTier': str(getattr(r, 'hike_tier', TIER_NONE)),'hikeTierBn': str(tier_label),'hikeTierCls': str(tier_cls),'extensionPct': safe_float(getattr(r, 'extension_pct_from_sma20', 0.0), 2),'sma20': safe_float(getattr(r, 'sma20_value', 0.0), 2),'volDivDays': safe_int(getattr(r, 'volume_divergence_days', 0)),'volDivTotal': safe_int(getattr(r, 'volume_divergence_total', 0)),'tierEntryAllowed': bool(getattr(r, 'hike_tier_entry_allowed', False))})
+
+    sp_json = safe_json_dumps(sp_data, ensure_ascii=False); sp_total = len(sp_data)
+    sp_buy = sum(1 for d in sp_data if d['canvasSignal']=='BUY'); sp_hold = sum(1 for d in sp_data if d['canvasSignal']=='HOLD')
+    sp_wait = sum(1 for d in sp_data if d['canvasSignal']=='WAIT'); sp_sell = sum(1 for d in sp_data if d['canvasSignal']=='SELL')
+    sp_strong = sum(1 for d in sp_data if d['smeCatcherLevel']=='STRONG'); sp_core = sum(1 for d in sp_data if d['smeCatcherLevel']=='CORE')
+
+    summary_data = [report_to_bangla_dict(r, dts) for r in reports]; summary_json = safe_json_dumps(summary_data, ensure_ascii=False)
+    s_total = len(summary_data); s_buy = sum(1 for d in summary_data if d['canvasSignal']=='BUY')
+    s_hold = sum(1 for d in summary_data if d['canvasSignal']=='HOLD'); s_wait = sum(1 for d in summary_data if d['canvasSignal']=='WAIT')
+    s_sell = sum(1 for d in summary_data if d['canvasSignal']=='SELL')
+
+    ab_data = []
+    for r in reports:
+        vb, vc = ab_vn(r.ab_selected_variant); act = ab_an(r.ab_selected_variant, r.ab_rpd_a, r.ab_rpd_b)
+        rpd_a = r.ab_rpd_a or 0.0; rpd_b = r.ab_rpd_b or 0.0; rpd_max = max(rpd_a, rpd_b, 1e-9)
+        rpd_norm = min(1.0, rpd_max / max_rpd_batch); conf_n = max(0.0, min(1.0, (r.ab_confidence_score or 0) / 100.0))
+        price = max(0.01, r.current_price or 0.01); tp = r.ab_take_profit or price; sl = r.ab_stop_loss or (price * 0.95)
+        reward = max(0.0, tp - price); risk_r = max(0.01, price - sl); rr = reward / risk_r
+        rr_n = max(0.0, min(1.0, rr / 3.0)); fuzzy_n = max(0.0, min(1.0, r.fuzzy_v3_S_rank or 0.0))
+        rank_score = 0.40 * rpd_norm + 0.25 * conf_n + 0.20 * rr_n + 0.15 * fuzzy_n
+        ps = (rpd_a * 0.4 + rpd_b * 0.4 + conf_n * 0.2) if (rpd_a + rpd_b) > 0 else 0.0
+        ab_data.append({'symbol': str(r.symbol),'price': safe_float(price, 2),'variantBn': str(vb),'variant': str(r.ab_selected_variant),'variantCls': str(vc),'actionBn': str(act),'rpdA': safe_float(rpd_a, 4),'rpdB': safe_float(rpd_b, 4),'expectedRpd': safe_float(r.ab_expected_rpd, 4),'confidence': safe_float(r.ab_confidence_score, 1),'entryPrice': safe_float(r.ab_entry_price, 2),'stopLoss': safe_float(r.ab_stop_loss, 2),'takeProfit': safe_float(r.ab_take_profit, 2),'positionSize': safe_int(r.ab_position_size),'maxLoss': safe_float(r.ab_max_loss, 2),'riskPerShare': safe_float(r.ab_risk_per_share, 2),'maxHoldingDays': safe_int(r.ab_max_holding_days),'productScore': safe_float(ps, 4),'rewardRisk': safe_float(rr, 2),'rankScore': safe_float(rank_score, 4),'rpdNorm': safe_float(rpd_norm, 4),'canvasSignal': str(r.canvas_signal),'hikeTier': str(getattr(r, 'hike_tier', TIER_NONE))})
+    ab_json = safe_json_dumps(ab_data, ensure_ascii=False); ab_total = len(ab_data)
+    ab_a = sum(1 for d in ab_data if d['variant']=='A'); ab_b = sum(1 for d in ab_data if d['variant']=='B')
+    ab_sp = sum(1 for d in ab_data if d['variant']=='SPLIT'); ab_no = sum(1 for d in ab_data if d['variant']=='NONE')
+    ab_tradeable = ab_a + ab_b + ab_sp
+
+    fuzzy_data = []
+    for r in reports:
+        ab_, ac = fz_bn(r.fuzzy_Action); sb = fz_sz(r.fuzzy_Action); rs = fz_rs(r)
+        ps = (abs(r.fuzzy_v3_S_rank) * ((r.fuzzy_v3_C + r.fuzzy_v3_R) / 2.0) if r.fuzzy_v3_C > 0 else 0.0)
+        fuzzy_data.append({'symbol': str(r.symbol),'price': safe_float(r.current_price, 2),'actionBn': str(ab_),'actionCls': str(ac),'action': str(r.fuzzy_Action),'sizeBn': str(sb),'finalScore': safe_float(r.fuzzy_v3_S_rank, 4),'S': safe_float(r.fuzzy_v3_S_rank, 4),'M': safe_float(r.fuzzy_v3_M, 4),'P': safe_float(r.fuzzy_v3_P, 4),'C': safe_float(r.fuzzy_v3_C, 4),'C_raw': safe_float(r.fuzzy_v3_C_raw, 4),'R': safe_float(r.fuzzy_v3_R, 4),'L': safe_float(r.fuzzy_v3_L, 4),'S_gate': safe_float(r.fuzzy_v3_S_gate, 4),'S_rank': safe_float(r.fuzzy_v3_S_rank, 4),'turnover_velocity': safe_float(r.fuzzy_v3_turnover_velocity, 6),'hard_gate_pass': safe_bool(r.fuzzy_v3_hard_gate_pass),'skip_reason': str(r.fuzzy_v3_skip_reason),'th_strong': safe_float(r.fuzzy_v3_th_strong, 4),'th_mild': safe_float(r.fuzzy_v3_th_mild, 4),'th_watch': safe_float(r.fuzzy_v3_th_watch, 4),'t': safe_float(r.fuzzy_t, 4),'N': safe_int(r.fuzzy_N),'reasons': rs,'productScore': safe_float(ps, 4),'canvasSignal': str(r.canvas_signal),'hikeTier': str(getattr(r, 'hike_tier', TIER_NONE))})
+    fuzzy_json = safe_json_dumps(fuzzy_data, ensure_ascii=False); fz_total = len(fuzzy_data)
+    fz_sb = sum(1 for d in fuzzy_data if d['action']=='Strong Buy'); fz_mb = sum(1 for d in fuzzy_data if d['action']=='Mild Buy')
+    fz_n = sum(1 for d in fuzzy_data if d['action']=='Neutral / Watch'); fz_av = sum(1 for d in fuzzy_data if d['action']=='Avoid')
+
+    sme_data = []
+    for r in reports:
+        cb, cc = sme_c(r.sme_catcher_level); eb = sme_e(r.sme_entry_type)
+        vbn = sme_v(r.sme_volume_ratio); lbn = sme_l(r.sme_l_score); pbn = sme_p(r.sme_position_size_pct, r.sme_catcher_level)
+        try: ls = float(r.sme_l_score)
+        except Exception: ls = 0.0
+        if r.sme_catcher_level == 'STRONG': ps = 0.7 + ls * 0.3
+        elif r.sme_catcher_level == 'CORE': ps = 0.4 + ls * 0.3
+        else: ps = 0.0
+        sme_data.append({'symbol': str(r.symbol),'price': safe_float(r.current_price, 2),'catcherBn': str(cb),'catcherCls': str(cc),'catcherLevel': str(r.sme_catcher_level),'entryBn': str(eb),'entryType': str(r.sme_entry_type),'lScore': safe_float(r.sme_l_score, 3),'lScoreBn': str(lbn),'volumeRatio': safe_float(r.sme_volume_ratio, 3),'volumeBn': str(vbn),'priceVsEma20': safe_float(r.sme_price_vs_ema20, 3),'ema20Rising': safe_bool(r.sme_ema20_rising),'closePosition': safe_float(r.sme_close_position, 3),'positionSizePct': safe_float(r.sme_position_size_pct, 1),'positionBn': str(pbn),'liquidityMult': safe_float(r.sme_liquidity_multiplier, 2),'productScore': safe_float(ps, 4),'canvasSignal': str(r.canvas_signal),'marketCapMissing': safe_bool(r.sme_market_cap_missing),'relativeStrength': safe_bool(r.sme_relative_strength),'emergencyFloorOk': safe_bool(r.sme_emergency_floor_ok),'adtv20': safe_float(r.sme_adtv_20, 0),'dataHealth': str(r.sme_data_health),'ignition': safe_bool(r.sme_ignition),'hikeTier': str(getattr(r, 'hike_tier', TIER_NONE))})
+    sme_json = safe_json_dumps(sme_data, ensure_ascii=False); sme_total = len(sme_data)
+    sme_strong = sum(1 for d in sme_data if d['catcherLevel']=='STRONG'); sme_core = sum(1 for d in sme_data if d['catcherLevel']=='CORE')
+    sme_none = sum(1 for d in sme_data if d['catcherLevel']=='NONE'); sme_mcap_missing = sum(1 for d in sme_data if d['marketCapMissing'])
+    sme_breakout = sum(1 for d in sme_data if d['entryType']=='Breakout'); sme_pullback = sum(1 for d in sme_data if d['entryType']=='Pullback')
+    sme_cont = sum(1 for d in sme_data if d['entryType']=='Continuation')
+
+    hike_data = []
+    for r in reports:
+        tier_label, tier_cls = TIER_BN.get(getattr(r, 'hike_tier', TIER_NONE), ('', ''))
+        hike_data.append({'symbol': str(r.symbol),'price': safe_float(r.current_price, 2),'sma20': safe_float(getattr(r, 'sma20_value', 0.0), 2),'extensionPct': safe_float(getattr(r, 'extension_pct_from_sma20', 0.0), 2),'volDivDays': safe_int(getattr(r, 'volume_divergence_days', 0)),'volDivTotal': safe_int(getattr(r, 'volume_divergence_total', 0)),'hikeTier': str(getattr(r, 'hike_tier', TIER_NONE)),'hikeTierBn': str(tier_label),'hikeTierCls': str(tier_cls),'tierEntryAllowed': bool(getattr(r, 'hike_tier_entry_allowed', False)),'rsi': safe_float(r.rsi_value, 1),'finalSignal': str(r.final_signal),'finalScore': safe_float(r.final_score, 4),'canvasSignal': str(r.canvas_signal),'canvasReason': str(r.canvas_reason)})
+    hike_json = safe_json_dumps(hike_data, ensure_ascii=False); hike_total = len(hike_data)
+    hike_counts = {t: sum(1 for d in hike_data if d['hikeTier'] == t) for t in TIER_ORDER}
+
+    parts = []
+    parts.append('<!DOCTYPE html><html lang="bn"><head><meta charset="UTF-8">')
+    parts.append('<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">')
+    parts.append(f'<title>সব বাংলা রিপোর্ট (একীভূত – ৬টি ট্যাব) — {dts}</title>')
+    parts.append('''<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#eef2f7; color:#1f2937; padding:12px; line-height:1.65; }
+.wrap { max-width:1400px; margin:0 auto; }
+.head { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); border-radius:20px; padding:22px 26px; margin-bottom:14px; color:#fff; box-shadow:0 10px 40px rgba(102,126,234,0.28); }
+.head h1 { font-size:24px; margin-bottom:4px; }
+.head .sub { font-size:13.5px; opacity:0.95; }
+.head .mode { display:inline-block; background:rgba(255,255,255,0.22); padding:4px 14px; border-radius:20px; font-size:12.5px; margin-top:10px; }
+.tabs { display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; background:#fff; padding:10px; border-radius:16px; box-shadow:0 4px 20px rgba(0,0,0,0.05); }
+.tab-btn { padding:10px 18px; border:none; background:#f1f5f9; border-radius:30px; font-size:13.5px; font-weight:600; cursor:pointer; color:#475569; font-family:inherit; transition:all .15s; }
+.tab-btn:hover { background:#e2e8f0; }
+.tab-btn.active { background:#2563eb; color:#fff; }
+.tab-btn.tab-swing { background:#fef3c7; color:#92400e; border:1px dashed #f59e0b; }
+.tab-btn.tab-swing.active { background:linear-gradient(90deg,#f59e0b,#ea580c); color:#fff; border:none; }
+.tab-btn.tab-hike { background:#fee2e2; color:#991b1b; border:1px dashed #dc2626; }
+.tab-btn.tab-hike.active { background:linear-gradient(90deg,#dc2626,#ef4444); color:#fff; border:none; }
+.tab-content { display:none; } .tab-content.active { display:block; }
+.sum-head { background:#fff; border-radius:18px; padding:16px 20px; box-shadow:0 6px 22px rgba(15,23,42,0.06); margin-bottom:14px; }
+.sum-head h2 { font-size:20px; color:#0f172a; margin-bottom:4px; }
+.sum-head .sub { font-size:13px; color:#64748b; margin-bottom:12px; }
+.counts { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; }
+.cnt { background:#f8fafc; border:1px solid #e5e7eb; border-radius:12px; padding:10px; text-align:center; }
+.cnt .num { font-size:22px; font-weight:800; color:#0f172a; }
+.cnt .lbl { font-size:12px; color:#475569; margin-top:2px; }
+.cnt.buy .num { color:#15803d; } .cnt.hold .num { color:#a16207; } .cnt.wait .num { color:#475569; }
+.cnt.sell .num { color:#b91c1c; } .cnt.ign .num { color:#c2410c; } .cnt.radar .num { color:#0369a1; }
+.cnt.stat-blue .num { color:#2563eb; } .cnt.stat-green .num { color:#059669; }
+.cnt.stat-purple .num { color:#7c3aed; } .cnt.stat-orange .num { color:#ea580c; } .cnt.stat-warn .num { color:#f59e0b; }
+.cnt.tier-none .num { color:#64748b; } .cnt.tier-early .num { color:#059669; }
+.cnt.tier-mid .num { color:#a16207; } .cnt.tier-late .num { color:#ea580c; } .cnt.tier-exhaust .num { color:#dc2626; }
+.filters { background:#fff; border-radius:16px; padding:14px 16px; margin-bottom:14px; box-shadow:0 6px 20px rgba(15,23,42,0.05); display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
+.f { display:flex; flex-direction:column; gap:4px; min-width:140px; flex:1 1 auto; }
+.f.wide { min-width:220px; flex:2 1 auto; } .f.narrow { min-width:100px; flex:0 1 auto; }
+.f label { font-size:12px; font-weight:600; color:#334155; }
+.f input, .f select { padding:9px 12px; border:1px solid #cbd5e1; border-radius:10px; font-size:14px; background:#fff; outline:none; font-family:inherit; width:100%; }
+.f input:focus, .f select:focus { border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,0.12); }
+.btn { padding:10px 18px; border:none; border-radius:10px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; background:#2563eb; color:#fff; }
+.btn.ghost { background:#e2e8f0; color:#334155; }
+.show-count { width:100%; font-size:13.5px; color:#334155; padding-top:8px; border-top:1px dashed #e5e7eb; }
+.show-count b { color:#2563eb; font-size:15px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(360px,1fr)); gap:14px; }
+.grid.wide { grid-template-columns:repeat(auto-fill,minmax(430px,1fr)); }
+.card { background:#fff; border-radius:18px; overflow:hidden; box-shadow:0 6px 22px rgba(15,23,42,0.06); border:1px solid #eef2f7; display:flex; flex-direction:column; }
+.card.none { opacity:0.7; }
+.sum-card-top { padding:14px 16px 12px; border-bottom:1px solid #eef2f7; }
+.sum-sym { font-size:21px; font-weight:800; color:#0f172a; }
+.sum-sym .radar-pill { margin-left:6px; font-size:11.5px; padding:3px 9px; background:#e0f2fe; color:#0369a1; border-radius:12px; font-weight:700; vertical-align:middle; }
+.sum-sym .radar-pill.hot { background:#0ea5e9; color:#fff; }
+.tier-pill { display:inline-block; margin-left:6px; font-size:11.5px; padding:3px 9px; border-radius:12px; font-weight:700; vertical-align:middle; }
+.tier-pill.none { background:#e2e8f0; color:#475569; } .tier-pill.early { background:#d1fae5; color:#065f46; }
+.tier-pill.mid { background:#fef3c7; color:#92400e; } .tier-pill.late { background:#ffedd5; color:#9a3412; } .tier-pill.exhaust { background:#fee2e2; color:#991b1b; }
+.price-row { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:8px; flex-wrap:wrap; }
+.price-row .pr { font-size:26px; font-weight:800; color:#0c4a6e; } .price-row .pr small { font-size:14px; color:#0369a1; margin-left:3px; }
+.price-row .proj { background:#f0f9ff; padding:8px 12px; border-radius:10px; font-size:13px; color:#0f172a; border:1px solid #bae6fd; }
+.price-row .proj b { font-size:16px; color:#0f766e; }
+.rec { padding:12px 16px; font-size:17px; font-weight:700; text-align:center; }
+.rec.buy { background:#dcfce7; color:#166534; } .rec.hold { background:#fef9c3; color:#854d0e; }
+.rec.wait { background:#e2e8f0; color:#334155; } .rec.sell { background:#fee2e2; color:#991b1b; }
+.fuzzy-strip { padding:9px 16px; font-size:13px; font-weight:600; background:#f5f3ff; color:#5b21b6; border-top:1px solid #ede9fe; }
+.fuzzy-strip.buy { background:#ecfdf5; color:#065f46; border-top-color:#a7f3d0; }
+.fuzzy-strip.hold { background:#fefce8; color:#854d0e; border-top-color:#fef08a; }
+.fuzzy-strip.wait { background:#f1f5f9; color:#334155; border-top-color:#e2e8f0; }
+.fuzzy-strip.sell { background:#fef2f2; color:#991b1b; border-top-color:#fecaca; }
+.sum-body { padding:12px 16px 14px; }
+.block { margin-bottom:12px; } .block:last-child { margin-bottom:0; }
+.block h3 { font-size:13.5px; color:#0f172a; margin-bottom:6px; }
+.block ul { margin-left:18px; } .block li { font-size:13.5px; margin-bottom:3px; } .block p { font-size:13.5px; }
+.levels { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+.level { background:#f8fafc; border:1px solid #e5e7eb; border-radius:12px; padding:10px 8px; text-align:center; }
+.level .lbl { font-size:11.5px; color:#64748b; margin-bottom:4px; }
+.level .val { font-size:18px; font-weight:800; } .level .val small { font-size:12px; color:#475569; }
+.level.buy .val { color:#15803d; } .level.tgt .val { color:#0369a1; } .level.stop .val { color:#b91c1c; }
+.flags-inline { display:flex; flex-wrap:wrap; gap:6px; }
+.flag-chip { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; padding:3px 10px; border-radius:12px; font-size:12px; }
+.ignition-strip { background:linear-gradient(90deg,#fff7ed,#ffedd5); border-left:5px solid #f97316; padding:8px 12px; font-size:13.5px; color:#9a3412; font-weight:600; }
+.exhaust-strip { background:linear-gradient(90deg,#fef2f2,#fee2e2); border-left:5px solid #dc2626; padding:8px 12px; font-size:13.5px; color:#991b1b; font-weight:600; }
+.ab-card-header { padding:18px 20px 14px; background:linear-gradient(135deg,#f8fafc 0%,#f1f5f9 100%); border-bottom:1px solid #e2e8f0; }
+.ab-card-header .sym { font-size:22px; font-weight:800; color:#1e293b; }
+.ab-card-header .price { font-size:18px; color:#667eea; font-weight:700; margin-top:4px; }
+.ab-variant { display:inline-block; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; margin-top:8px; }
+.ab-variant.a { background:#dbeafe; color:#1d4ed8; } .ab-variant.b { background:#d1fae5; color:#059669; }
+.ab-variant.split { background:#fef3c7; color:#b45309; } .ab-variant.none { background:#fee2e2; color:#dc2626; }
+.ab-action { background:#f0fdf4; border:1px solid #bbf7d0; border-radius:12px; padding:12px 16px; margin-bottom:14px; font-size:14px; font-weight:600; color:#166534; }
+.ab-action.none { background:#fef2f2; border-color:#fecaca; color:#991b1b; }
+.metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:14px; }
+.metric { background:#f8fafc; border-radius:10px; padding:10px 12px; }
+.metric .lbl { font-size:11px; color:#64748b; } .metric .val { font-size:16px; font-weight:700; color:#1e293b; margin-top:2px; }
+.metric .val.green { color:#059669; } .metric .val.red { color:#dc2626; } .metric .val.blue { color:#2563eb; }
+.trade-plan { background:#fffbeb; border:1px solid #fde68a; border-radius:12px; padding:14px; margin-bottom:14px; }
+.trade-plan h4 { font-size:13px; color:#92400e; margin-bottom:10px; }
+.trade-plan .row { display:flex; justify-content:space-between; padding:4px 0; font-size:13px; }
+.trade-plan .row .k { color:#78716c; } .trade-plan .row .v { font-weight:700; color:#1e293b; }
+.trade-plan .row .v.green { color:#059669; } .trade-plan .row .v.red { color:#dc2626; }
+.rpd-compare { background:#f5f3ff; border-radius:12px; padding:12px 14px; margin-bottom:14px; }
+.rpd-compare h4 { font-size:12px; color:#6b21a8; margin-bottom:8px; }
+.rpd-bar { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+.rpd-bar .label { font-size:12px; width:50px; color:#64748b; }
+.rpd-bar .bar { flex:1; height:20px; background:#e9d5ff; border-radius:10px; overflow:hidden; }
+.rpd-bar .bar .fill { height:100%; border-radius:10px; background:linear-gradient(90deg,#8b5cf6,#a78bfa); }
+.rpd-bar .bar .fill.b { background:linear-gradient(90deg,#059669,#34d399); }
+.rpd-bar .value { font-size:12px; font-weight:700; color:#5b21b6; width:60px; text-align:right; }
+.product-score { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); border-radius:12px; padding:12px 16px; color:#fff; display:flex; justify-content:space-between; align-items:center; }
+.product-score .lbl { font-size:12px; opacity:0.9; } .product-score .val { font-size:22px; font-weight:800; }
+.fz-card-header { padding:16px 20px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0; }
+.fz-card-header .sym { font-size:22px; font-weight:800; color:#1e293b; } .fz-card-header .price { font-size:16px; color:#64748b; }
+.action-badge { padding:10px 20px; text-align:center; font-size:16px; font-weight:700; }
+.action-badge.buy-strong { background:linear-gradient(90deg,#059669,#10b981); color:#fff; }
+.action-badge.buy-mild { background:#d1fae5; color:#065f46; }
+.action-badge.neutral { background:#f1f5f9; color:#475569; }
+.action-badge.sell-mild { background:#fef3c7; color:#92400e; }
+.action-badge.sell-strong { background:linear-gradient(90deg,#dc2626,#ef4444); color:#fff; }
+.score-section { background:#f5f3ff; border-radius:12px; padding:14px; margin-bottom:14px; }
+.score-section h4 { font-size:12px; color:#6b21a8; margin-bottom:10px; }
+.score-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.score-row .label { font-size:12px; width:80px; color:#64748b; }
+.score-row .bar { flex:1; height:18px; background:#e9d5ff; border-radius:9px; overflow:hidden; }
+.score-row .bar .fill { height:100%; border-radius:9px; background:linear-gradient(90deg,#8b5cf6,#a78bfa); }
+.score-row .bar .fill.green { background:linear-gradient(90deg,#059669,#34d399); }
+.score-row .bar .fill.blue { background:linear-gradient(90deg,#2563eb,#60a5fa); }
+.score-row .value { font-size:12px; font-weight:700; color:#5b21b6; width:50px; text-align:right; }
+.final-score { background:linear-gradient(135deg,#8b5cf6 0%,#7c3aed 100%); border-radius:12px; padding:14px 18px; color:#fff; display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+.final-score .lbl { font-size:13px; opacity:0.9; } .final-score .val { font-size:24px; font-weight:800; }
+.fz-reasons { background:#f0fdf4; border-radius:12px; padding:12px 16px; margin-bottom:14px; }
+.fz-reasons h4 { font-size:12px; color:#166534; margin-bottom:8px; }
+.fz-reasons ul { margin-left:18px; } .fz-reasons li { font-size:13px; color:#166534; margin-bottom:4px; }
+.size-box { background:#fef3c7; border:1px solid #fde68a; border-radius:12px; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+.size-box .lbl { font-size:12px; color:#92400e; } .size-box .val { font-size:15px; font-weight:700; color:#92400e; }
+.params { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:14px; padding-top:14px; border-top:1px dashed #e5e7eb; }
+.param { background:#f8fafc; border-radius:8px; padding:8px; text-align:center; }
+.param .lbl { font-size:10px; color:#64748b; } .param .val { font-size:13px; font-weight:700; color:#1e293b; }
+.sme-card-header { padding:16px 20px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0; }
+.sme-card-header .sym { font-size:22px; font-weight:800; color:#1e293b; } .sme-card-header .price { font-size:16px; color:#64748b; }
+.mcap-warn { font-size:10px; background:#fef3c7; color:#92400e; padding:2px 6px; border-radius:8px; margin-left:6px; }
+.catcher-badge { padding:10px 20px; text-align:center; font-size:16px; font-weight:700; }
+.catcher-badge.strong { background:linear-gradient(90deg,#dc2626,#ef4444); color:#fff; }
+.catcher-badge.core { background:#d1fae5; color:#065f46; } .catcher-badge.none { background:#f1f5f9; color:#64748b; }
+.entry-box { background:#eff6ff; border:1px solid #bfdbfe; border-radius:12px; padding:12px 16px; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; }
+.entry-box .lbl { font-size:12px; color:#1d4ed8; } .entry-box .val { font-size:15px; font-weight:700; color:#1d4ed8; }
+.sme-metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:14px; }
+.sme-metric { background:#f8fafc; border-radius:10px; padding:10px 12px; }
+.sme-metric .lbl { font-size:11px; color:#64748b; } .sme-metric .val { font-size:15px; font-weight:700; color:#1e293b; margin-top:2px; }
+.sme-metric .val.green { color:#059669; } .sme-metric .val.red { color:#dc2626; } .sme-metric .val.orange { color:#ea580c; }
+.sme-score-section { background:#f0fdf4; border-radius:12px; padding:14px; margin-bottom:14px; }
+.sme-score-section h4 { font-size:12px; color:#166534; margin-bottom:10px; }
+.sme-score-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.sme-score-row .label { font-size:12px; width:70px; color:#64748b; }
+.sme-score-row .bar { flex:1; height:18px; background:#d1fae5; border-radius:9px; overflow:hidden; }
+.sme-score-row .bar .fill { height:100%; border-radius:9px; background:linear-gradient(90deg,#059669,#34d399); }
+.sme-score-row .value { font-size:12px; font-weight:700; color:#065f46; width:50px; text-align:right; }
+.position-box { background:#fef3c7; border:1px solid #fde68a; border-radius:12px; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+.position-box .lbl { font-size:12px; color:#92400e; } .position-box .val { font-size:15px; font-weight:700; color:#92400e; }
+.position-box.skip { background:#f1f5f9; border-color:#e2e8f0; }
+.position-box.skip .lbl, .position-box.skip .val { color:#64748b; }
+.sme-final-score { background:linear-gradient(135deg,#059669 0%,#10b981 100%); border-radius:12px; padding:14px 18px; color:#fff; display:flex; justify-content:space-between; align-items:center; }
+.sme-final-score.none { background:linear-gradient(135deg,#6b7280 0%,#9ca3af 100%); }
+.sme-final-score .lbl { font-size:13px; opacity:0.9; } .sme-final-score .val { font-size:24px; font-weight:800; }
+.hike-card { background:#fff; border-radius:18px; overflow:hidden; box-shadow:0 6px 22px rgba(15,23,42,0.06); border:1px solid #fee2e2; display:flex; flex-direction:column; }
+.hike-card.tier-none { border-color:#e2e8f0; } .hike-card.tier-early { border-color:#a7f3d0; }
+.hike-card.tier-mid { border-color:#fde68a; } .hike-card.tier-late { border-color:#fdba74; } .hike-card.tier-exhaust { border-color:#fca5a5; }
+.hike-card-top { padding:14px 16px 12px; border-bottom:1px solid #eef2f7; }
+.hike-sym { font-size:20px; font-weight:800; color:#0f172a; } .hike-price { font-size:16px; color:#0c4a6e; font-weight:700; margin-top:2px; }
+.hike-tier-badge { padding:10px 16px; text-align:center; font-size:15px; font-weight:700; }
+.hike-tier-badge.none { background:#f1f5f9; color:#475569; } .hike-tier-badge.early { background:#d1fae5; color:#065f46; }
+.hike-tier-badge.mid { background:#fef9c3; color:#854d0e; } .hike-tier-badge.late { background:#ffedd5; color:#9a3412; }
+.hike-tier-badge.exhaust { background:linear-gradient(90deg,#dc2626,#ef4444); color:#fff; }
+.hike-body { padding:12px 16px; }
+.hike-metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }
+.hike-metric { background:#f8fafc; border-radius:10px; padding:8px 10px; }
+.hike-metric .lbl { font-size:11px; color:#64748b; } .hike-metric .val { font-size:15px; font-weight:700; color:#0f172a; }
+.hike-metric .val.green { color:#059669; } .hike-metric .val.red { color:#dc2626; }
+.hike-metric .val.orange { color:#ea580c; } .hike-metric .val.blue { color:#2563eb; }
+.hike-ext-bar { height:14px; background:linear-gradient(90deg,#d1fae5 0%,#fef3c7 25%,#ffedd5 55%,#fee2e2 100%); border-radius:7px; position:relative; margin:10px 0; }
+.hike-ext-marker { width:4px; height:20px; background:#0f172a; position:absolute; top:-3px; border-radius:2px; }
+.sp-card { background:#fff; border-radius:18px; overflow:hidden; box-shadow:0 6px 22px rgba(15,23,42,0.06); border:2px solid #fef3c7; display:flex; flex-direction:column; }
+.sp-card-top { padding:14px 16px 12px; background:linear-gradient(135deg,#fffbeb 0%,#fef3c7 100%); border-bottom:1px solid #fde68a; }
+.sp-sym { font-size:21px; font-weight:800; color:#92400e; }
+.sp-sym .radar-pill { margin-left:6px; font-size:11.5px; padding:3px 9px; background:#fef3c7; color:#92400e; border-radius:12px; font-weight:700; border:1px solid #f59e0b; vertical-align:middle; }
+.sp-sym .radar-pill.hot { background:#f59e0b; color:#fff; border-color:#d97706; }
+.sp-price-row { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:8px; flex-wrap:wrap; }
+.sp-price-row .pr { font-size:24px; font-weight:800; color:#78350f; } .sp-price-row .pr small { font-size:14px; color:#a16207; margin-left:3px; }
+.sp-price-row .proj { background:#fff; padding:8px 12px; border-radius:10px; font-size:13px; color:#0f172a; border:1px solid #fde68a; }
+.sp-price-row .proj b { font-size:16px; color:#0f766e; }
+.sp-rec { padding:10px 16px; font-size:16px; font-weight:700; text-align:center; }
+.sp-rec.buy { background:#dcfce7; color:#166534; } .sp-rec.hold { background:#fef9c3; color:#854d0e; }
+.sp-rec.wait { background:#e2e8f0; color:#334155; } .sp-rec.sell { background:#fee2e2; color:#991b1b; }
+.sp-body { padding:12px 16px 14px; }
+.sp-section { background:#f8fafc; border-radius:12px; padding:10px 12px; margin-bottom:10px; border-left:4px solid #94a3b8; }
+.sp-section.ab { border-left-color:#667eea; background:#f5f7ff; }
+.sp-section.fz { border-left-color:#8b5cf6; background:#faf5ff; }
+.sp-section.sme { border-left-color:#059669; background:#f0fdf4; }
+.sp-section.hike { border-left-color:#dc2626; background:#fef2f2; }
+.sp-section h4 { font-size:12.5px; color:#0f172a; margin-bottom:6px; font-weight:700; display:flex; justify-content:space-between; align-items:center; gap:6px; }
+.sp-section .row { display:flex; justify-content:space-between; padding:2px 0; font-size:12.5px; gap:10px; }
+.sp-section .row .k { color:#64748b; flex-shrink:0; } .sp-section .row .v { font-weight:700; color:#1e293b; text-align:right; }
+.sp-section .row .v.green { color:#059669; } .sp-section .row .v.red { color:#dc2626; }
+.sp-section .row .v.blue { color:#2563eb; } .sp-section .row .v.orange { color:#ea580c; } .sp-section .row .v.purple { color:#7c3aed; }
+.sp-badge { display:inline-block; padding:2px 10px; border-radius:12px; font-size:11px; font-weight:700; }
+.sp-badge.buy-strong { background:#059669; color:#fff; } .sp-badge.buy-mild { background:#d1fae5; color:#065f46; }
+.sp-badge.neutral { background:#f1f5f9; color:#475569; } .sp-badge.sell-mild { background:#fef3c7; color:#92400e; }
+.sp-badge.sell-strong { background:#dc2626; color:#fff; } .sp-badge.strong { background:#dc2626; color:#fff; }
+.sp-badge.core { background:#d1fae5; color:#065f46; } .sp-badge.none { background:#f1f5f9; color:#64748b; }
+.sp-badge.a { background:#dbeafe; color:#1d4ed8; } .sp-badge.b { background:#d1fae5; color:#059669; } .sp-badge.split { background:#fef3c7; color:#b45309; }
+.sp-verdict { display:inline-block; padding:2px 10px; border-radius:12px; font-size:11px; font-weight:700; }
+.sp-verdict.green { background:#dcfce7; color:#166534; } .sp-verdict.yellow { background:#fef9c3; color:#854d0e; } .sp-verdict.red { background:#fee2e2; color:#991b1b; }
+.sp-flags { display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; }
+.sp-flag-chip { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; padding:2px 8px; border-radius:10px; font-size:11px; }
+.empty { text-align:center; padding:40px 20px; color:#64748b; background:#fff; border-radius:16px; }
+.empty .big { font-size:42px; margin-bottom:8px; }
+.foot { text-align:center; color:#64748b; font-size:12.5px; margin:18px 0 6px; }
+.print-btn { position:fixed; right:16px; bottom:16px; z-index:100; background:#2563eb; color:#fff; border:none; padding:14px 18px; border-radius:50%; font-size:22px; cursor:pointer; box-shadow:0 10px 25px rgba(37,99,235,0.35); font-family:inherit; }
+.print-btn:hover { background:#1d4ed8; }
+@media print { body { background:#fff; padding:0; } .filters, .print-btn, .tabs { display:none !important; } .grid, .grid.wide { grid-template-columns:1fr 1fr; gap:8px; } .card, .sp-card, .hike-card { box-shadow:none; border:1px solid #ddd; break-inside:avoid; } }
+</style>''')
+    parts.append('</head><body><div class="wrap">')
+
+    parts.append(f'''
+  <div class="head">
+    <h1>📄 সব বাংলা রিপোর্ট (একীভূত – ৬টি ট্যাব) — v1.31 (JSON API + Weekend Fix)</h1>
+    <div class="sub">রিপোর্ট সময়: <b>{dts}</b> &bull; অ্যাকাউন্ট: <b>{account_equity:,.0f}</b> টাকা</div>
+    <div class="mode">📈 A/B মোড: {'স্বল্পমেয়াদী (১০ দিন)' if ab_mode == 'SHORT' else 'দীর্ঘমেয়াদী (২০ দিন)'}</div>
+  </div>''')
+
+    parts.append('''
+  <div class="tabs">
+    <button class="tab-btn tab-swing active" onclick="switchTab('swingparam')">🎯 Swing Parameter</button>
+    <button class="tab-btn tab-hike" onclick="switchTab('hike')">🥾 Hike Tier</button>
+    <button class="tab-btn" onclick="switchTab('summary')">📄 সহজ সারসংক্ষেপ</button>
+    <button class="tab-btn" onclick="switchTab('ab')">📊 A/B Testing MCMC</button>
+    <button class="tab-btn" onclick="switchTab('fuzzy')">🧠 ফাজি লজিক</button>
+    <button class="tab-btn" onclick="switchTab('sme')">🚀 Swing Momentum</button>
+  </div>''')
+
+    parts.append(f'''
+  <div id="tab-swingparam" class="tab-content active">
+    <div class="sum-head" style="background:linear-gradient(135deg,#fffbeb,#fef3c7);border-left:5px solid #f59e0b;">
+      <h2>🎯 Swing Parameter — একীভূত ভিউ (v1.31)</h2>
+      <div class="sub">মোট স্টক: <b>{sp_total}</b></div>
+      <div class="counts">
+        <div class="cnt buy"><div class="num">{sp_buy}</div><div class="lbl">🟢 BUY</div></div>
+        <div class="cnt hold"><div class="num">{sp_hold}</div><div class="lbl">🟡 HOLD</div></div>
+        <div class="cnt wait"><div class="num">{sp_wait}</div><div class="lbl">⏳ WAIT</div></div>
+        <div class="cnt sell"><div class="num">{sp_sell}</div><div class="lbl">🔴 SELL</div></div>
+        <div class="cnt ign"><div class="num">{sum(1 for d in sp_data if d['hasIgnition'])}</div><div class="lbl">🔥 Ignition</div></div>
+        <div class="cnt radar"><div class="num">{sum(1 for d in sp_data if d['radarScore'] >= 3)}</div><div class="lbl">📡 Radar</div></div>
+        <div class="cnt stat-blue"><div class="num">{ab_a}</div><div class="lbl">🅰️ A/B – A</div></div>
+        <div class="cnt stat-green"><div class="num">{ab_b}</div><div class="lbl">🅱️ A/B – B</div></div>
+        <div class="cnt stat-orange"><div class="num">{ab_sp}</div><div class="lbl">⚖️ A/B – Split</div></div>
+        <div class="cnt sell"><div class="num">{ab_no}</div><div class="lbl">❌ A/B – None</div></div>
+        <div class="cnt stat-green"><div class="num">{fz_sb + fz_mb}</div><div class="lbl">🧠 Fuzzy Buy</div></div>
+        <div class="cnt sell"><div class="num">{fz_av}</div><div class="lbl">🧠 Fuzzy Avoid</div></div>
+        <div class="cnt sell"><div class="num">{sp_strong}</div><div class="lbl">🔥 SME Strong</div></div>
+        <div class="cnt stat-green"><div class="num">{sp_core}</div><div class="lbl">✅ SME Core</div></div>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="f wide"><label>🔍 স্টকের নাম</label><input type="text" id="sp_fSearch" placeholder="যেমন: BATBC" oninput="applyFiltersSP()"></div>
+      <div class="f"><label>📈 Canvas Signal</label><select id="sp_fCanvas" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="BUY">🟢 BUY</option><option value="HOLD">🟡 HOLD</option><option value="WAIT">⏳ WAIT</option><option value="SELL">🔴 SELL</option></select></div>
+      <div class="f"><label>🏷️ Verdict</label><select id="sp_fVerdict" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="GREEN">GREEN</option><option value="YELLOW">YELLOW</option><option value="RED">RED</option></select></div>
+      <div class="f"><label>📊 A/B Variant</label><select id="sp_fABVariant" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="A">🅰️ A</option><option value="B">🅱️ B</option><option value="SPLIT">⚖️ SPLIT</option><option value="NONE">❌ NONE</option></select></div>
+      <div class="f"><label>🧠 Fuzzy Action</label><select id="sp_fFuzzyAction" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="Strong Buy">🟢🟢 Strong Buy</option><option value="Mild Buy">🟢 Mild Buy</option><option value="Neutral / Watch">⏳ Neutral</option><option value="Avoid">🔴 Avoid</option></select></div>
+      <div class="f"><label>🚀 SME Catcher</label><select id="sp_fSMECatcher" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="STRONG">🔥 শক্তিশালী</option><option value="CORE">✅ মূল</option><option value="NONE">⏭️ এড়িয়ে যান</option></select></div>
+      <div class="f"><label>🎯 SME Entry</label><select id="sp_fSMEEntry" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="Breakout">🚀 ব্রেকআউট</option><option value="Pullback">📉 পুলব্যাক</option><option value="Continuation">➡️ কন্টিনিউয়েশন</option><option value="None">⏭️ নেই</option></select></div>
+      <div class="f"><label>📡 Radar</label><select id="sp_fRadar" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="yes">Radar ≥ 3</option><option value="ignition">🔥 VOL_IGNITION</option><option value="no">Radar &lt; 3</option></select></div>
+      <div class="f"><label>🥾 Hike Tier</label><select id="sp_fHikeTier" onchange="applyFiltersSP()">
+        <option value="all">সব</option><option value="NONE">⚪ NONE</option><option value="EARLY_SETUP">🟢 EARLY_SETUP</option><option value="MID_HIKE">🟡 MID_HIKE</option><option value="LATE_HIKE">🟠 LATE_HIKE</option><option value="EXHAUSTION_WATCH">🔴 EXHAUSTION_WATCH</option></select></div>
+      <div class="f narrow"><label>🎯 Final Score ≥</label><input type="number" id="sp_fFinalScore" placeholder="0.00" step="0.05" min="0" max="1" oninput="applyFiltersSP()"></div>
+      <div class="f narrow"><label>🧠 Fuzzy Final ≥</label><input type="number" id="sp_fFuzzyMin" placeholder="-1..1" step="0.05" min="-1" max="1" oninput="applyFiltersSP()"></div>
+      <div class="f narrow"><label>📊 RPD ≥</label><input type="number" id="sp_fRpdMin" placeholder="0.00" step="0.01" min="0" oninput="applyFiltersSP()"></div>
+      <div class="f narrow"><label>📈 L_score ≥</label><input type="number" id="sp_fLScoreMin" placeholder="0.00" step="0.05" min="0" max="1" oninput="applyFiltersSP()"></div>
+      <div class="f narrow"><label>💰 Position % ≥</label><input type="number" id="sp_fPosMin" placeholder="0" step="5" min="0" max="100" oninput="applyFiltersSP()"></div>
+      <button class="btn ghost" onclick="resetFiltersSP()">↺ রিসেট</button>
+      <div class="show-count">দেখানো হচ্ছে <b id="sp_shown">0</b> / <span id="sp_total">{sp_total}</span> স্টক</div>
+    </div>
+    <div id="swingParamGrid" class="grid wide"></div>
+  </div>''')
+
+    parts.append(f'''
+  <div id="tab-hike" class="tab-content">
+    <div class="sum-head" style="background:linear-gradient(135deg,#fef2f2,#fee2e2);border-left:5px solid #dc2626;">
+      <h2>🥾 Hike-Tier Engine — v1.31</h2>
+      <div class="sub">Extension = (close / SMA_20 − 1) × 100 &nbsp;|&nbsp; মোট: <b>{hike_total}</b></div>
+      <div class="counts">
+        <div class="cnt tier-none"><div class="num">{hike_counts.get(TIER_NONE,0)}</div><div class="lbl">⚪ NONE</div></div>
+        <div class="cnt tier-early"><div class="num">{hike_counts.get(TIER_EARLY,0)}</div><div class="lbl">🟢 EARLY</div></div>
+        <div class="cnt tier-mid"><div class="num">{hike_counts.get(TIER_MID,0)}</div><div class="lbl">🟡 MID</div></div>
+        <div class="cnt tier-late"><div class="num">{hike_counts.get(TIER_LATE,0)}</div><div class="lbl">🟠 LATE</div></div>
+        <div class="cnt tier-exhaust"><div class="num">{hike_counts.get(TIER_EXHAUSTION,0)}</div><div class="lbl">🔴 EXHAUST</div></div>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="f wide"><label>🔍 স্টকের নাম</label><input type="text" id="hk_fSearch" placeholder="যেমন: SAPORTL" oninput="applyFiltersHike()"></div>
+      <div class="f"><label>🥾 Hike Tier</label><select id="hk_fTier" onchange="applyFiltersHike()">
+        <option value="all">সব</option><option value="NONE">⚪ NONE</option><option value="EARLY_SETUP">🟢 EARLY_SETUP</option><option value="MID_HIKE">🟡 MID_HIKE</option><option value="LATE_HIKE">🟠 LATE_HIKE</option><option value="EXHAUSTION_WATCH">🔴 EXHAUSTION_WATCH</option></select></div>
+      <div class="f"><label>📈 Final Signal</label><select id="hk_fSignal" onchange="applyFiltersHike()">
+        <option value="all">সব</option><option value="BUY">🟢 BUY</option><option value="HOLD">🟡 HOLD</option><option value="WAIT">⏳ WAIT</option><option value="SELL">🔴 SELL</option></select></div>
+      <div class="f narrow"><label>📊 Extension % ≥</label><input type="number" id="hk_fExtMin" placeholder="-10" step="0.5" oninput="applyFiltersHike()"></div>
+      <div class="f narrow"><label>📉 Vol-Div Days ≥</label><input type="number" id="hk_fVdMin" placeholder="0" step="1" min="0" max="10" oninput="applyFiltersHike()"></div>
+      <div class="f"><label>✅ Entry Allowed</label><select id="hk_fAllowed" onchange="applyFiltersHike()">
+        <option value="all">সব</option><option value="yes">✅ হ্যাঁ</option><option value="no">⛔ না</option></select></div>
+      <button class="btn ghost" onclick="resetFiltersHike()">↺ রিসেট</button>
+      <div class="show-count">দেখানো হচ্ছে <b id="hk_shown">0</b> / <span id="hk_total">{hike_total}</span> স্টক</div>
+    </div>
+    <div id="hikeGrid" class="grid wide"></div>
+  </div>''')
+
+    parts.append(f'''
+  <div id="tab-summary" class="tab-content">
+    <div class="sum-head">
+      <h2>📄 সব স্টকের সহজ বাংলা রিপোর্ট</h2>
+      <div class="sub">মোট: <b>{s_total}</b></div>
+      <div class="counts">
+        <div class="cnt buy"><div class="num">{s_buy}</div><div class="lbl">🟢 কেনার যোগ্য</div></div>
+        <div class="cnt hold"><div class="num">{s_hold}</div><div class="lbl">🟡 হাতে রাখুন</div></div>
+        <div class="cnt wait"><div class="num">{s_wait}</div><div class="lbl">⏳ অপেক্ষা করুন</div></div>
+        <div class="cnt sell"><div class="num">{s_sell}</div><div class="lbl">🔴 বিক্রি</div></div>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="f wide"><label>🔍 স্টকের নাম</label><input type="text" id="s_fSearch" placeholder="যেমন: BATBC" oninput="applyFiltersSummary()"></div>
+      <div class="f"><label>📌 কী করবেন</label><select id="s_fRec" onchange="applyFiltersSummary()">
+        <option value="all">সব</option><option value="BUY">🟢 কেনার যোগ্য</option><option value="HOLD">🟡 হাতে রাখুন</option><option value="WAIT">⏳ অপেক্ষা করুন</option><option value="SELL">🔴 বিক্রি</option></select></div>
+      <div class="f"><label>📡 Radar</label><select id="s_fRadar" onchange="applyFiltersSummary()">
+        <option value="all">সব</option><option value="yes">৩ বা বেশি</option><option value="hot">🔥 Ignition</option><option value="no">৩ এর কম</option></select></div>
+      <div class="f"><label>🏷️ Verdict</label><select id="s_fVerdict" onchange="applyFiltersSummary()">
+        <option value="all">সব</option><option value="GREEN">GREEN</option><option value="YELLOW">YELLOW</option><option value="RED">RED</option></select></div>
+      <div class="f"><label>🧠 Fuzzy</label><select id="s_fFuzzy" onchange="applyFiltersSummary()">
+        <option value="all">সব</option><option value="Strong Buy">🟢🟢 Strong Buy</option><option value="Mild Buy">🟢 Mild Buy</option><option value="Neutral / Watch">⏳ Neutral</option><option value="Avoid">🔴 Avoid</option></select></div>
+      <div class="f"><label>🥾 Hike Tier</label><select id="s_fHikeTier" onchange="applyFiltersSummary()">
+        <option value="all">সব</option><option value="NONE">⚪ NONE</option><option value="EARLY_SETUP">🟢 EARLY_SETUP</option><option value="MID_HIKE">🟡 MID_HIKE</option><option value="LATE_HIKE">🟠 LATE_HIKE</option><option value="EXHAUSTION_WATCH">🔴 EXHAUSTION_WATCH</option></select></div>
+      <button class="btn ghost" onclick="resetFiltersSummary()">↺ রিসেট</button>
+      <div class="show-count">দেখানো হচ্ছে <b id="s_shown">0</b> / <span id="s_total">{s_total}</span> স্টক</div>
+    </div>
+    <div id="summaryGrid" class="grid"></div>
+  </div>''')
+
+    parts.append(f'''
+  <div id="tab-ab" class="tab-content">
+    <div class="sum-head">
+      <h2>📊 Swing A/B Testing MCMC (v1.31, Risk 1.2%)</h2>
+      <div class="counts">
+        <div class="cnt stat-blue"><div class="num">{ab_total}</div><div class="lbl">মোট</div></div>
+        <div class="cnt stat-blue"><div class="num">{ab_a}</div><div class="lbl">🅰️ মোমেন্টাম</div></div>
+        <div class="cnt stat-green"><div class="num">{ab_b}</div><div class="lbl">🅱️ ভ্যালু</div></div>
+        <div class="cnt stat-orange"><div class="num">{ab_sp}</div><div class="lbl">⚖️ ৫০/৫০</div></div>
+        <div class="cnt sell"><div class="num">{ab_no}</div><div class="lbl">❌ ট্রেড নেই</div></div>
+        <div class="cnt stat-purple"><div class="num">{ab_tradeable}</div><div class="lbl">✅ ট্রেডযোগ্য</div></div>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="f wide"><label>🔍 স্টকের নাম</label><input type="text" id="ab_fSearch" placeholder="যেমন: BATBC" oninput="applyFiltersAB()"></div>
+      <div class="f"><label>📌 কৌশল</label><select id="ab_fVariant" onchange="applyFiltersAB()">
+        <option value="all">সব</option><option value="A">🅰️ মোমেন্টাম</option><option value="B">🅱️ ভ্যালু</option><option value="SPLIT">⚖️ ৫০/৫০</option><option value="NONE">❌ ট্রেড নেই</option></select></div>
+      <div class="f"><label>📊 Product Score ≥</label><input type="number" id="ab_fProductMin" placeholder="০.০০" step="0.05" min="0" max="1" oninput="applyFiltersAB()"></div>
+      <div class="f"><label>📈 RPD ≥</label><input type="number" id="ab_fRpdMin" placeholder="০.০০" step="0.01" min="0" oninput="applyFiltersAB()"></div>
+      <button class="btn ghost" onclick="resetFiltersAB()">↺ রিসেট</button>
+      <div class="show-count">দেখানো হচ্ছে <b id="ab_shown">0</b> / <span id="ab_total">{ab_total}</span> স্টক</div>
+    </div>
+    <div id="abGrid" class="grid"></div>
+  </div>''')
+
+    parts.append(f'''
+  <div id="tab-fuzzy" class="tab-content">
+    <div class="sum-head">
+      <h2>🧠 ফাজি লজিক বাংলা রিপোর্ট — v1.31</h2>
+      <div class="counts">
+        <div class="cnt"><div class="num">{fz_total}</div><div class="lbl">মোট</div></div>
+        <div class="cnt stat-green"><div class="num">{fz_sb}</div><div class="lbl">🟢🟢 দৃঢ় ক্রয়</div></div>
+        <div class="cnt stat-green"><div class="num">{fz_mb}</div><div class="lbl">🟢 মৃদু ক্রয়</div></div>
+        <div class="cnt wait"><div class="num">{fz_n}</div><div class="lbl">⏳ নিরপেক্ষ</div></div>
+        <div class="cnt sell"><div class="num">{fz_av}</div><div class="lbl">🔴 এড়িয়ে যান</div></div>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="f wide"><label>🔍 স্টকের নাম</label><input type="text" id="fz_fSearch" placeholder="যেমন: BATBC" oninput="applyFiltersFuzzy()"></div>
+      <div class="f"><label>📌 সংকেত</label><select id="fz_fAction" onchange="applyFiltersFuzzy()">
+        <option value="all">সব</option><option value="Strong Buy">🟢🟢 দৃঢ় ক্রয়</option><option value="Mild Buy">🟢 মৃদু ক্রয়</option><option value="Neutral / Watch">⏳ নিরপেক্ষ</option><option value="Avoid">🔴 এড়িয়ে যান</option></select></div>
+      <div class="f"><label>🥾 Hike Tier</label><select id="fz_fHikeTier" onchange="applyFiltersFuzzy()">
+        <option value="all">সব</option><option value="NONE">⚪ NONE</option><option value="EARLY_SETUP">🟢 EARLY_SETUP</option><option value="MID_HIKE">🟡 MID_HIKE</option><option value="LATE_HIKE">🟠 LATE_HIKE</option><option value="EXHAUSTION_WATCH">🔴 EXHAUSTION_WATCH</option></select></div>
+      <div class="f"><label>📊 Score ≥</label><input type="number" id="fz_fScoreMin" placeholder="-1..1" step="0.05" min="-1" max="1" oninput="applyFiltersFuzzy()"></div>
+      <div class="f"><label>📈 Product Score ≥</label><input type="number" id="fz_fProductMin" placeholder="০.০০" step="0.05" min="0" max="1" oninput="applyFiltersFuzzy()"></div>
+      <button class="btn ghost" onclick="resetFiltersFuzzy()">↺ রিসেট</button>
+      <div class="show-count">দেখানো হচ্ছে <b id="fz_shown">0</b> / <span id="fz_total">{fz_total}</span> স্টক</div>
+    </div>
+    <div id="fuzzyGrid" class="grid"></div>
+  </div>''')
+
+    parts.append(f'''
+  <div id="tab-sme" class="tab-content">
+    <div class="sum-head">
+      <h2>🚀 Swing Momentum Engine (v1.31)</h2>
+      <div class="counts">
+        <div class="cnt"><div class="num">{sme_total}</div><div class="lbl">মোট</div></div>
+        <div class="cnt sell"><div class="num">{sme_strong}</div><div class="lbl">🔥 শক্তিশালী</div></div>
+        <div class="cnt stat-green"><div class="num">{sme_core}</div><div class="lbl">✅ মূল</div></div>
+        <div class="cnt wait"><div class="num">{sme_none}</div><div class="lbl">⏭️ এড়িয়ে যান</div></div>
+        <div class="cnt stat-warn"><div class="num">{sme_mcap_missing}</div><div class="lbl">⚠️ MCap নেই</div></div>
+        <div class="cnt stat-blue"><div class="num">{sme_breakout}</div><div class="lbl">🚀 ব্রেকআউট</div></div>
+        <div class="cnt stat-purple"><div class="num">{sme_pullback}</div><div class="lbl">📉 পুলব্যাক</div></div>
+        <div class="cnt stat-orange"><div class="num">{sme_cont}</div><div class="lbl">➡️ কন্টিনিউয়েশন</div></div>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="f wide"><label>🔍 স্টকের নাম</label><input type="text" id="sme_fSearch" placeholder="যেমন: BATBC" oninput="applyFiltersSME()"></div>
+      <div class="f"><label>📌 সন্ধান স্তর</label><select id="sme_fCatcher" onchange="applyFiltersSME()">
+        <option value="all">সব</option><option value="STRONG">🔥 শক্তিশালী</option><option value="CORE">✅ মূল</option><option value="NONE">⏭️ এড়িয়ে যান</option></select></div>
+      <div class="f"><label>📌 প্রবেশ</label><select id="sme_fEntry" onchange="applyFiltersSME()">
+        <option value="all">সব</option><option value="Breakout">🚀 ব্রেকআউট</option><option value="Pullback">📉 পুলব্যাক</option><option value="Continuation">➡️ কন্টিনিউয়েশন</option><option value="None">⏭️ নেই</option></select></div>
+      <div class="f"><label>📊 L_score ≥</label><input type="number" id="sme_fLMin" placeholder="০.০০" step="0.05" min="0" max="1" oninput="applyFiltersSME()"></div>
+      <div class="f"><label>📈 Product Score ≥</label><input type="number" id="sme_fProductMin" placeholder="০.০০" step="0.05" min="0" max="1" oninput="applyFiltersSME()"></div>
+      <div class="f"><label>⚠️ Market Cap</label><select id="sme_fMcap" onchange="applyFiltersSME()">
+        <option value="all">সব</option><option value="missing">ডেটা নেই</option><option value="ok">ডেটা আছে</option></select></div>
+      <button class="btn ghost" onclick="resetFiltersSME()">↺ রিসেট</button>
+      <div class="show-count">দেখানো হচ্ছে <b id="sme_shown">0</b> / <span id="sme_total">{sme_total}</span> স্টক</div>
+    </div>
+    <div id="smeGrid" class="grid"></div>
+  </div>''')
+
+    parts.append(f'''
+  <div class="foot">
+    DSE Canvas Scanner • ৬টি ট্যাব • v1.31 • {dts}<br>
+    ⚠️ এই রিপোর্ট শুধুমাত্র তথ্যসূত্র। বিনিয়োগের আগে নিজে যাচাই করুন।
+  </div>
+</div>
+<button class="print-btn" onclick="window.print()" title="PDF হিসেবে সংরক্ষণ করুন">📥</button>''')
+
+    parts.append('<script>')
+    parts.append('''
+function switchTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  var tab = document.getElementById('tab-' + name);
+  if (tab) tab.classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    var oc = b.getAttribute('onclick') || '';
+    if (oc.indexOf("'" + name + "'") !== -1) b.classList.add('active');
+  });
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+''')
+
+    parts.append(f'const SP_DATA = {sp_json};')
+    parts.append('''
+function spCardHtml(d) {
+  const radarCls = d.radarScore >= 5 ? 'hot' : '';
+  const ignBadge = d.hasIgnition ? '<span style="background:#f97316;color:#fff;padding:2px 8px;border-radius:10px;font-size:10.5px;font-weight:700;margin-left:6px;">🔥</span>' : '';
+  const vCls = (d.verdict || '').toLowerCase();
+  const flagsHtml = (d.radarFlagLines && d.radarFlagLines.length) ? d.radarFlagLines.map(function(f){ return '<span class="sp-flag-chip">' + esc(f) + '</span>'; }).join('') : '<span style="font-size:11.5px;color:#64748b;">বিশেষ ইঙ্গিত নেই</span>';
+  const fzReasonsHtml = (d.fuzzyReasons && d.fuzzyReasons.length) ? d.fuzzyReasons.map(function(r){ return '<div style="font-size:12px;color:#5b21b6;margin-top:2px;">• ' + esc(r) + '</div>'; }).join('') : '';
+  const tierBadge = d.hikeTierBn ? '<span class="tier-pill ' + d.hikeTierCls + '">🥾 ' + esc(d.hikeTierBn) + '</span>' : '';
+  const hikeSection = '<div class="sp-section hike"><h4><span>🥾 Hike-Tier</span>' + tierBadge + '</h4>' +
+    '<div class="row"><span class="k">Extension %</span><span class="v ' + (d.extensionPct > 32 ? 'red' : d.extensionPct > 20 ? 'orange' : 'green') + '">' + d.extensionPct + '%</span></div>' +
+    '<div class="row"><span class="k">SMA20</span><span class="v">' + d.sma20 + '৳</span></div>' +
+    '<div class="row"><span class="k">Vol-Div Days</span><span class="v ' + (d.volDivDays >= 3 ? 'red' : d.volDivDays >= 2 ? 'orange' : '') + '">' + d.volDivDays + '</span></div>' +
+    '<div class="row"><span class="k">Entry Allowed</span><span class="v ' + (d.tierEntryAllowed ? 'green' : 'red') + '">' + (d.tierEntryAllowed ? '✅ হ্যাঁ' : '⛔ না') + '</span></div></div>';
+  return '<div class="sp-card"><div class="sp-card-top">' +
+      '<div class="sp-sym">' + esc(d.symbol) + '<span class="radar-pill ' + radarCls + '">📡 ' + d.radarScore + '</span>' + ignBadge + '</div>' +
+      '<div class="sp-price-row"><div class="pr">' + d.price + '<small>৳</small></div>' +
+        '<div class="proj">১সপ্তাহ: <b>' + d.proj + '৳</b> (' + d.projArrow + ' ' + Math.abs(d.projDiff) + '%)</div></div></div>' +
+    '<div class="sp-rec ' + d.recClass + '">' + esc(d.recText) + '</div><div class="sp-body">' +
+      '<div class="sp-section"><h4><span>📄 সারসংক্ষেপ</span><span class="sp-verdict ' + vCls + '">' + d.verdict + '</span></h4>' +
+        '<div class="row"><span class="k">Canvas</span><span class="v">' + d.canvasSignal + '</span></div>' +
+        '<div class="row"><span class="k">Final Score</span><span class="v purple">' + d.finalScore + '</span></div>' +
+        '<div class="row"><span class="k">কারণ</span><span class="v" style="font-size:11px;">' + esc(d.canvasReason || '') + '</span></div>' +
+        '<div class="row"><span class="k">কেনার সীমা</span><span class="v green">' + d.buyZone + '৳</span></div>' +
+        '<div class="row"><span class="k">লক্ষ্য</span><span class="v blue">' + d.target + '৳</span></div>' +
+        '<div class="row"><span class="k">সতর্কতার সীমা</span><span class="v red">' + d.stop + '৳</span></div>' +
+        '<div class="row"><span class="k">RSI / ADX</span><span class="v">' + d.rsi + ' / ' + d.adx + '</span></div>' +
+        '<div class="row"><span class="k">aMQS / Asset</span><span class="v">' + d.aMQS + ' / ' + d.assetClass + '</span></div></div>' +
+      hikeSection +
+      '<div class="sp-section ab"><h4><span>📊 A/B Testing MCMC</span><span class="sp-badge ' + d.abVariantCls + '">' + esc(d.abVariantBn) + '</span></h4>' +
+        '<div class="row"><span class="k">RPD (A / B)</span><span class="v">' + d.abRpdA + ' / ' + d.abRpdB + '</span></div>' +
+        '<div class="row"><span class="k">প্রত্যাশিত RPD</span><span class="v blue">' + d.abExpectedRpd + '</span></div>' +
+        '<div class="row"><span class="k">Position Size</span><span class="v">' + d.abPositionSize + ' শেয়ার</span></div>' +
+        '<div class="row"><span class="k">Confidence</span><span class="v">' + d.abConfidence + '%</span></div></div>' +
+      '<div class="sp-section fz"><h4><span>🧠 ফাজি লজিক v3</span><span class="sp-badge ' + d.fuzzyActionCls + '">' + esc(d.fuzzyAction) + '</span></h4>' +
+        '<div class="row"><span class="k">M / P / C</span><span class="v">' + d.fuzzyM + ' / ' + d.fuzzyP + ' / ' + d.fuzzyC + '</span></div>' +
+        '<div class="row"><span class="k">R / L</span><span class="v">' + d.fuzzyR + ' / ' + d.fuzzyL + '</span></div>' +
+        '<div class="row"><span class="k">Gate × Rank</span><span class="v purple">' + d.fuzzySGate + ' × ' + d.fuzzySRank + '</span></div>' +
+        '<div class="row"><span class="k">Size</span><span class="v">' + esc(d.fuzzySizeBn) + '</span></div>' +
+        (fzReasonsHtml ? '<div style="margin-top:6px;">' + fzReasonsHtml + '</div>' : '') + '</div>' +
+      '<div class="sp-section sme"><h4><span>🚀 Swing Momentum Engine</span><span class="sp-badge ' + d.smeCatcherCls + '">' + esc(d.smeCatcherBn) + '</span></h4>' +
+        '<div class="row"><span class="k">Entry Type</span><span class="v">' + esc(d.smeEntryBn) + '</span></div>' +
+        '<div class="row"><span class="k">L_score</span><span class="v green">' + d.smeLScore + ' (' + d.smeLScoreBn + ')</span></div>' +
+        '<div class="row"><span class="k">Position %</span><span class="v orange">' + d.smePositionSizePct + '%</span></div>' +
+        '<div class="row"><span class="k">Volume Ratio</span><span class="v">' + d.smeVolumeRatio + 'x</span></div></div>' +
+      '<div class="sp-section" style="border-left-color:#0ea5e9; background:#f0f9ff;"><h4 style="color:#0369a1;">📡 RADAR</h4>' +
+        '<div class="sp-flags">' + flagsHtml + '</div></div></div></div>';
+}
+function applyFiltersSP() {
+  const s      = (document.getElementById('sp_fSearch').value || '').trim().toLowerCase();
+  const canvas = document.getElementById('sp_fCanvas').value;
+  const verdict= document.getElementById('sp_fVerdict').value;
+  const abVar  = document.getElementById('sp_fABVariant').value;
+  const fzAct  = document.getElementById('sp_fFuzzyAction').value;
+  const smeCat = document.getElementById('sp_fSMECatcher').value;
+  const smeEnt = document.getElementById('sp_fSMEEntry').value;
+  const radar  = document.getElementById('sp_fRadar').value;
+  const hikeT  = document.getElementById('sp_fHikeTier').value;
+  const fsMin  = document.getElementById('sp_fFinalScore').value;
+  const fzMin  = document.getElementById('sp_fFuzzyMin').value;
+  const rpdMin = document.getElementById('sp_fRpdMin').value;
+  const lMin   = document.getElementById('sp_fLScoreMin').value;
+  const posMin = document.getElementById('sp_fPosMin').value;
+  const rows = SP_DATA.filter(function(d) {
+    if (s && d.symbol.toLowerCase().indexOf(s) === -1) return false;
+    if (canvas !== 'all' && d.canvasSignal !== canvas) return false;
+    if (verdict !== 'all' && d.verdict !== verdict) return false;
+    if (abVar !== 'all' && d.abVariant !== abVar) return false;
+    if (fzAct !== 'all' && d.fuzzyActionEn !== fzAct) return false;
+    if (smeCat !== 'all' && d.smeCatcherLevel !== smeCat) return false;
+    if (smeEnt !== 'all' && d.smeEntryType !== smeEnt) return false;
+    if (hikeT !== 'all' && d.hikeTier !== hikeT) return false;
+    const rs = d.radarScore || 0;
+    if (radar === 'yes' && rs < 3) return false;
+    if (radar === 'no' && rs >= 3) return false;
+    if (radar === 'ignition' && !d.hasIgnition) return false;
+    if (fsMin !== '' && (d.finalScore === null || d.finalScore === undefined || d.finalScore < parseFloat(fsMin))) return false;
+    if (fzMin !== '' && (d.fuzzyS === null || d.fuzzyS === undefined || d.fuzzyS < parseFloat(fzMin))) return false;
+    if (rpdMin !== '') { const rpd = Math.max(d.abRpdA || 0, d.abRpdB || 0); if (rpd < parseFloat(rpdMin)) return false; }
+    if (lMin !== '' && (d.smeLScore === null || d.smeLScore === undefined || d.smeLScore < parseFloat(lMin))) return false;
+    if (posMin !== '' && (d.smePositionSizePct === null || d.smePositionSizePct === undefined || d.smePositionSizePct < parseFloat(posMin))) return false;
+    return true;
+  });
+  const rank = {'BUY':0,'HOLD':1,'WAIT':2,'SELL':3};
+  rows.sort(function(a,b) {
+    if (a.hasIgnition !== b.hasIgnition) return a.hasIgnition ? -1 : 1;
+    if (b.radarScore !== a.radarScore) return b.radarScore - a.radarScore;
+    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+    return (rank[a.canvasSignal] === undefined ? 9 : rank[a.canvasSignal]) - (rank[b.canvasSignal] === undefined ? 9 : rank[b.canvasSignal]);
+  });
+  document.getElementById('sp_shown').textContent = rows.length;
+  document.getElementById('sp_total').textContent = SP_DATA.length;
+  document.getElementById('swingParamGrid').innerHTML = rows.length ? rows.map(spCardHtml).join('') : '<div class="empty"><div class="big">🔍</div>এই শর্তে কোনো স্টক পাওয়া যায়নি।</div>';
+}
+function resetFiltersSP() {
+  ['sp_fSearch','sp_fFinalScore','sp_fFuzzyMin','sp_fRpdMin','sp_fLScoreMin','sp_fPosMin'].forEach(function(id){ document.getElementById(id).value = ''; });
+  ['sp_fCanvas','sp_fVerdict','sp_fABVariant','sp_fFuzzyAction','sp_fSMECatcher','sp_fSMEEntry','sp_fRadar','sp_fHikeTier'].forEach(function(id){ document.getElementById(id).value = 'all'; });
+  applyFiltersSP();
+}
+''')
+
+    parts.append(f'const HIKE_DATA = {hike_json};')
+    parts.append('''
+function hikeCardHtml(d) {
+  const tierCls = d.hikeTierCls || 'none';
+  const extPos = Math.max(0, Math.min(100, (d.extensionPct + 5) / 50 * 100));
+  const tierBn = d.hikeTierBn || '';
+  const allowed = d.tierEntryAllowed ? '✅ হ্যাঁ' : '⛔ না';
+  const allowedCls = d.tierEntryAllowed ? 'green' : 'red';
+  const vdCls = d.volDivDays >= 3 ? 'red' : d.volDivDays >= 2 ? 'orange' : 'green';
+  const extCls = d.extensionPct > 32 ? 'red' : d.extensionPct > 20 ? 'orange' : d.extensionPct >= 4 ? 'green' : 'blue';
+  const exhaustStrip = d.hikeTier === 'EXHAUSTION_WATCH' ? '<div class="exhaust-strip">🔴 EXHAUSTION_WATCH — প্রবেশ করবেন না।</div>' : '';
+  return '<div class="hike-card tier-' + tierCls + '"><div class="hike-card-top">' +
+      '<div class="hike-sym">' + esc(d.symbol) + '</div>' +
+      '<div class="hike-price">৳ ' + d.price + ' &nbsp;•&nbsp; SMA20: ৳ ' + d.sma20 + '</div></div>' +
+    '<div class="hike-tier-badge ' + tierCls + '">' + esc(tierBn) + '</div>' + exhaustStrip + '<div class="hike-body">' +
+      '<div class="hike-metrics">' +
+        '<div class="hike-metric"><div class="lbl">Extension %</div><div class="val ' + extCls + '">' + d.extensionPct + '%</div></div>' +
+        '<div class="hike-metric"><div class="lbl">Vol-Div Days</div><div class="val ' + vdCls + '">' + d.volDivDays + ' / ' + d.volDivTotal + '</div></div>' +
+        '<div class="hike-metric"><div class="lbl">RSI</div><div class="val">' + d.rsi + '</div></div>' +
+        '<div class="hike-metric"><div class="lbl">Entry Allowed</div><div class="val ' + allowedCls + '">' + allowed + '</div></div>' +
+        '<div class="hike-metric"><div class="lbl">Final Signal</div><div class="val blue">' + esc(d.finalSignal) + '</div></div>' +
+        '<div class="hike-metric"><div class="lbl">Final Score</div><div class="val">' + d.finalScore + '</div></div></div>' +
+      '<div class="hike-ext-bar"><div class="hike-ext-marker" style="left:' + extPos.toFixed(1) + '%"></div></div>' +
+      '<div style="font-size:11px;color:#64748b;display:flex;justify-content:space-between;"><span>−5%</span><span>4%</span><span>10%</span><span>20%</span><span>32%</span><span>45%</span></div>' +
+      '<div style="margin-top:8px;font-size:11.5px;color:#475569;">কারণ: ' + esc(d.canvasReason || '') + '</div></div></div>';
+}
+function applyFiltersHike() {
+  const s = (document.getElementById('hk_fSearch').value || '').trim().toLowerCase();
+  const t = document.getElementById('hk_fTier').value;
+  const sig = document.getElementById('hk_fSignal').value;
+  const extMin = parseFloat(document.getElementById('hk_fExtMin').value);
+  const vdMin = parseFloat(document.getElementById('hk_fVdMin').value);
+  const allowed = document.getElementById('hk_fAllowed').value;
+  const rows = HIKE_DATA.filter(function(d) {
+    if (s && d.symbol.toLowerCase().indexOf(s) === -1) return false;
+    if (t !== 'all' && d.hikeTier !== t) return false;
+    if (sig !== 'all' && d.finalSignal !== sig) return false;
+    if (!isNaN(extMin) && d.extensionPct < extMin) return false;
+    if (!isNaN(vdMin) && d.volDivDays < vdMin) return false;
+    if (allowed === 'yes' && !d.tierEntryAllowed) return false;
+    if (allowed === 'no' && d.tierEntryAllowed) return false;
+    return true;
+  });
+  const order = {'EARLY_SETUP':0,'MID_HIKE':1,'NONE':2,'LATE_HIKE':3,'EXHAUSTION_WATCH':4};
+  rows.sort(function(a,b){
+    var oa = order[a.hikeTier] === undefined ? 9 : order[a.hikeTier];
+    var ob = order[b.hikeTier] === undefined ? 9 : order[b.hikeTier];
+    if (oa !== ob) return oa - ob;
+    return (b.finalScore || 0) - (a.finalScore || 0);
+  });
+  document.getElementById('hk_shown').textContent = rows.length;
+  document.getElementById('hk_total').textContent = HIKE_DATA.length;
+  document.getElementById('hikeGrid').innerHTML = rows.length ? rows.map(hikeCardHtml).join('') : '<div class="empty"><div class="big">🔍</div>এই শর্তে কোনো স্টক পাওয়া যায়নি।</div>';
+}
+function resetFiltersHike() {
+  ['hk_fSearch','hk_fExtMin','hk_fVdMin'].forEach(function(id){ document.getElementById(id).value = ''; });
+  ['hk_fTier','hk_fSignal','hk_fAllowed'].forEach(function(id){ document.getElementById(id).value = 'all'; });
+  applyFiltersHike();
+}
+''')
+
+    parts.append(f'const SUMMARY_DATA = {summary_json};')
+    parts.append('''
+function summaryCardHtml(d) {
+  const radarCls = d.radarScore >= 5 ? 'hot' : '';
+  const reasons = d.reasons.map(function(r){ return '<li>' + esc(r) + '</li>'; }).join('');
+  const flags = d.flags.map(function(f){ return '<span class="flag-chip">' + esc(f) + '</span>'; }).join('');
+  const ignStrip = d.hasIgnition ? '<div class="ignition-strip">🔥 হঠাৎ লেনদেন অনেক বেড়েছে।</div>' : '';
+  const exhaustStrip = (d.hikeTier === 'EXHAUSTION_WATCH') ? '<div class="exhaust-strip">🔴 EXHAUSTION_WATCH — প্রবেশ করবেন না।</div>' : '';
+  const fuzzyStripCls = (d.fuzzyColor || 'wait');
+  const fuzzyStrip = '<div class="fuzzy-strip ' + fuzzyStripCls + '">🧠 ফাজি v3: <b>' + esc(d.fuzzyAction) + '</b> | স্কোর: <b>' + d.fuzzyFinal + '</b> | Final: <b>' + d.finalScore + '</b></div>';
+  const tierPill = d.hikeTierBn ? '<span class="tier-pill ' + d.hikeTierCls + '">🥾 ' + esc(d.hikeTierBn) + '</span>' : '';
+  return '<div class="card"><div class="sum-card-top">' +
+      '<div class="sum-sym">' + esc(d.symbol) + '<span class="radar-pill ' + radarCls + '">📡 ' + d.radarScore + '</span>' + tierPill + '</div>' +
+      '<div class="price-row"><div class="pr">' + d.price + '<small>৳</small></div>' +
+        '<div class="proj">১সপ্তাহ: <b>' + d.proj + ' ৳</b> (' + d.projArrow + ' ' + Math.abs(d.projDiff) + '%)</div></div></div>' +
+    '<div class="rec ' + d.recClass + '">' + esc(d.recText) + '</div>' + fuzzyStrip + ignStrip + exhaustStrip + '<div class="sum-body">' +
+      '<div class="block"><h3>📌 এখন কী ঘটছে</h3><p>' + esc(d.trend) + '।</p>' +
+        '<p style="margin-top:4px;">দামের গতি: <b>' + esc(d.rsiText) + '</b>।</p>' +
+        '<p style="margin-top:4px;">🥾 হাইক: <b>' + esc(d.hikeTierBn) + '</b> (ext ' + d.extensionPct + '%)।</p></div>' +
+      '<div class="block"><h3>🔍 কারণ</h3><ul>' + reasons + '</ul></div>' +
+      '<div class="block"><h3>📡 ইঙ্গিত</h3><div class="flags-inline">' + (flags || '<span style="font-size:13.5px;color:#64748b;">বিশেষ কিছু নেই।</span>') + '</div></div>' +
+      '<div class="block"><h3>💰 দামের সীমা</h3><div class="levels">' +
+          '<div class="level buy"><div class="lbl">কেনার আদর্শ</div><div class="val">' + d.buyZone + '<small>৳</small></div></div>' +
+          '<div class="level tgt"><div class="lbl">লক্ষ্য</div><div class="val">' + d.target + '<small>৳</small></div></div>' +
+          '<div class="level stop"><div class="lbl">সতর্কতার সীমা</div><div class="val">' + d.stop + '<small>৳</small></div></div></div></div></div></div>';
+}
+function applyFiltersSummary() {
+  const s   = (document.getElementById('s_fSearch').value || '').trim().toLowerCase();
+  const rec = document.getElementById('s_fRec').value;
+  const rad = document.getElementById('s_fRadar').value;
+  const vd  = document.getElementById('s_fVerdict').value;
+  const fz  = document.getElementById('s_fFuzzy').value;
+  const hk  = document.getElementById('s_fHikeTier').value;
+  const rows = SUMMARY_DATA.filter(function(d) {
+    if (s && d.symbol.toLowerCase().indexOf(s) === -1) return false;
+    if (rec !== 'all' && d.canvasSignal !== rec) return false;
+    if (vd !== 'all' && d.verdict !== vd) return false;
+    if (rad === 'yes' && d.radarScore < 3) return false;
+    if (rad === 'no' && d.radarScore >= 3) return false;
+    if (rad === 'hot' && !d.hasIgnition) return false;
+    if (fz !== 'all' && d.fuzzyActionEn !== fz) return false;
+    if (hk !== 'all' && d.hikeTier !== hk) return false;
+    return true;
+  });
+  const rank = {'BUY':0,'HOLD':1,'WAIT':2,'SELL':3};
+  rows.sort(function(a,b) {
+    if (a.hasIgnition !== b.hasIgnition) return a.hasIgnition ? -1 : 1;
+    if (b.radarScore !== a.radarScore) return b.radarScore - a.radarScore;
+    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+    return (rank[a.canvasSignal] === undefined ? 9 : rank[a.canvasSignal]) - (rank[b.canvasSignal] === undefined ? 9 : rank[b.canvasSignal]);
+  });
+  document.getElementById('s_shown').textContent = rows.length;
+  document.getElementById('s_total').textContent = SUMMARY_DATA.length;
+  document.getElementById('summaryGrid').innerHTML = rows.length ? rows.map(summaryCardHtml).join('') : '<div class="empty"><div class="big">🔍</div>এই শর্তে কোনো স্টক পাওয়া যায়নি।</div>';
+}
+function resetFiltersSummary() {
+  document.getElementById('s_fSearch').value = '';
+  ['s_fRec','s_fRadar','s_fVerdict','s_fFuzzy','s_fHikeTier'].forEach(function(id){ document.getElementById(id).value = 'all'; });
+  applyFiltersSummary();
+}
+''')
+
+    parts.append(f'const AB_DATA = {ab_json};')
+    parts.append('''
+function abCardHtml(d) {
+  const maxRpd = Math.max(d.rpdA, d.rpdB, 0.001);
+  const barAWidth = (d.rpdA / maxRpd * 100).toFixed(1);
+  const barBWidth = (d.rpdB / maxRpd * 100).toFixed(1);
+  const actionClass = d.variant === 'NONE' ? 'none' : '';
+  const showTradePlan = d.positionSize > 0;
+  return '<div class="card"><div class="ab-card-header">' +
+      '<div class="sym">' + esc(d.symbol) + '</div>' +
+      '<div class="price">৳ ' + d.price + '</div>' +
+      '<span class="ab-variant ' + d.variantCls + '">' + esc(d.variantBn) + '</span></div>' +
+    '<div class="sum-body"><div class="ab-action ' + actionClass + '">' + esc(d.actionBn) + '</div>' +
+      '<div class="rpd-compare"><h4>📊 RPD তুলনা</h4>' +
+        '<div class="rpd-bar"><span class="label">🅰️</span><div class="bar"><div class="fill" style="width:' + barAWidth + '%"></div></div><span class="value">' + d.rpdA + '</span></div>' +
+        '<div class="rpd-bar"><span class="label">🅱️</span><div class="bar"><div class="fill b" style="width:' + barBWidth + '%"></div></div><span class="value">' + d.rpdB + '</span></div></div>' +
+      '<div class="metrics"><div class="metric"><div class="lbl">প্রত্যাশিত RPD</div><div class="val blue">' + d.expectedRpd + '</div></div>' +
+        '<div class="metric"><div class="lbl">আত্মবিশ্বাস</div><div class="val">' + d.confidence + '%</div></div></div>' +
+      (showTradePlan ?
+        '<div class="trade-plan"><h4>📋 ট্রেড প্ল্যান</h4>' +
+          '<div class="row"><span class="k">প্রবেশ মূল্য</span><span class="v">৳ ' + d.entryPrice + '</span></div>' +
+          '<div class="row"><span class="k">স্টপ লস</span><span class="v red">৳ ' + d.stopLoss + '</span></div>' +
+          '<div class="row"><span class="k">টেক প্রফিট</span><span class="v green">৳ ' + d.takeProfit + '</span></div>' +
+          '<div class="row"><span class="k">শেয়ার সংখ্যা</span><span class="v">' + d.positionSize + '</span></div>' +
+          '<div class="row"><span class="k">সর্বোচ্চ ঝুঁকি (১.২%)</span><span class="v red">৳ ' + d.maxLoss + '</span></div>' +
+          '<div class="row"><span class="k">সর্বোচ্চ দিন</span><span class="v">' + d.maxHoldingDays + ' দিন</span></div></div>' : '') +
+      '<div class="product-score"><span class="lbl">📊 Product Score</span><span class="val">' + d.productScore + '</span></div></div></div>';
+}
+function applyFiltersAB() {
+  const s = (document.getElementById('ab_fSearch').value || '').trim().toLowerCase();
+  const v = document.getElementById('ab_fVariant').value;
+  const pMin = parseFloat(document.getElementById('ab_fProductMin').value) || 0;
+  const rMin = parseFloat(document.getElementById('ab_fRpdMin').value) || 0;
+  const rows = AB_DATA.filter(function(d) {
+    if (s && d.symbol.toLowerCase().indexOf(s) === -1) return false;
+    if (v !== 'all' && d.variant !== v) return false;
+    if (d.productScore < pMin) return false;
+    if (d.expectedRpd < rMin) return false;
+    return true;
+  });
+  rows.sort(function(a,b){ return b.productScore - a.productScore; });
+  document.getElementById('ab_shown').textContent = rows.length;
+  document.getElementById('ab_total').textContent = AB_DATA.length;
+  document.getElementById('abGrid').innerHTML = rows.length ? rows.map(abCardHtml).join('') : '<div class="empty"><div class="big">🔍</div>এই শর্তে কোনো স্টক পাওয়া যায়নি।</div>';
+}
+function resetFiltersAB() {
+  document.getElementById('ab_fSearch').value = '';
+  document.getElementById('ab_fVariant').value = 'all';
+  document.getElementById('ab_fProductMin').value = '';
+  document.getElementById('ab_fRpdMin').value = '';
+  applyFiltersAB();
+}
+''')
+
+    parts.append(f'const FUZZY_DATA = {fuzzy_json};')
+    parts.append('''
+function fuzzyCardHtml(d) {
+  const mPct = (d.M * 100).toFixed(0); const pPct = (d.P * 100).toFixed(0);
+  const cPct = (d.C * 100).toFixed(0); const rPct = (d.R * 100).toFixed(0);
+  const lPct = (d.L * 100).toFixed(0); const crPct = (d.C_raw * 100).toFixed(0);
+  const reasonsHtml = d.reasons.map(function(r){ return '<li>' + esc(r) + '</li>'; }).join('');
+  const gateNote = d.hard_gate_pass ? '' : '<div style="background:#fef2f2;color:#991b1b;border-radius:10px;padding:8px 12px;font-size:12px;margin-top:8px;">⛔ ' + esc(d.skip_reason) + '</div>';
+  return '<div class="card"><div class="fz-card-header"><span class="sym">' + esc(d.symbol) + '</span><span class="price">৳ ' + d.price + '</span></div>' +
+    '<div class="action-badge ' + d.actionCls + '">' + esc(d.actionBn) + '</div><div class="sum-body">' +
+      '<div class="final-score"><span class="lbl">Rank Score</span><span class="val">' + d.S_rank + '</span></div>' +
+      '<div class="score-section"><h4>📊 ৫টি স্তর</h4>' +
+        '<div class="score-row"><span class="label">M</span><div class="bar"><div class="fill" style="width:' + mPct + '%"></div></div><span class="value">' + d.M + '</span></div>' +
+        '<div class="score-row"><span class="label">P</span><div class="bar"><div class="fill" style="width:' + pPct + '%"></div></div><span class="value">' + d.P + '</span></div>' +
+        '<div class="score-row"><span class="label">C</span><div class="bar"><div class="fill green" style="width:' + cPct + '%"></div></div><span class="value">' + d.C + '</span></div>' +
+        '<div class="score-row"><span class="label">C_raw</span><div class="bar"><div class="fill" style="width:' + crPct + '%"></div></div><span class="value">' + d.C_raw + '</span></div>' +
+        '<div class="score-row"><span class="label">R</span><div class="bar"><div class="fill blue" style="width:' + rPct + '%"></div></div><span class="value">' + d.R + '</span></div>' +
+        '<div class="score-row"><span class="label">L</span><div class="bar"><div class="fill" style="width:' + lPct + '%"></div></div><span class="value">' + d.L + '</span></div></div>' +
+      '<div class="fz-reasons"><h4>🔍 কারণ</h4><ul>' + reasonsHtml + '</ul></div>' +
+      '<div class="size-box"><span class="lbl">💰 বিনিয়োগ</span><span class="val">' + esc(d.sizeBn) + '</span></div>' +
+      '<div class="params">' +
+        '<div class="param"><div class="lbl">Gate</div><div class="val">' + d.S_gate + '</div></div>' +
+        '<div class="param"><div class="lbl">Rank</div><div class="val">' + d.S_rank + '</div></div>' +
+        '<div class="param"><div class="lbl">TV</div><div class="val">' + d.turnover_velocity + '</div></div>' +
+        '<div class="param"><div class="lbl">t</div><div class="val">' + d.t + '</div></div>' +
+        '<div class="param"><div class="lbl">N</div><div class="val">' + d.N + '</div></div>' +
+        '<div class="param"><div class="lbl">Th</div><div class="val">' + d.th_strong + '/' + d.th_mild + '/' + d.th_watch + '</div></div></div>' +
+      gateNote + '</div></div>';
+}
+function applyFiltersFuzzy() {
+  const s = (document.getElementById('fz_fSearch').value || '').trim().toLowerCase();
+  const a = document.getElementById('fz_fAction').value;
+  const hk = document.getElementById('fz_fHikeTier').value;
+  const sMin = parseFloat(document.getElementById('fz_fScoreMin').value) || -1;
+  const pMin = parseFloat(document.getElementById('fz_fProductMin').value) || 0;
+  const rows = FUZZY_DATA.filter(function(d) {
+    if (s && d.symbol.toLowerCase().indexOf(s) === -1) return false;
+    if (a !== 'all' && d.action !== a) return false;
+    if (hk !== 'all' && d.hikeTier !== hk) return false;
+    if (d.finalScore < sMin) return false;
+    if (d.productScore < pMin) return false;
+    return true;
+  });
+  rows.sort(function(a,b){ return b.productScore - a.productScore; });
+  document.getElementById('fz_shown').textContent = rows.length;
+  document.getElementById('fz_total').textContent = FUZZY_DATA.length;
+  document.getElementById('fuzzyGrid').innerHTML = rows.length ? rows.map(fuzzyCardHtml).join('') : '<div class="empty"><div class="big">🔍</div>এই শর্তে কোনো স্টক পাওয়া যায়নি।</div>';
+}
+function resetFiltersFuzzy() {
+  document.getElementById('fz_fSearch').value = '';
+  document.getElementById('fz_fAction').value = 'all';
+  document.getElementById('fz_fHikeTier').value = 'all';
+  document.getElementById('fz_fScoreMin').value = '';
+  document.getElementById('fz_fProductMin').value = '';
+  applyFiltersFuzzy();
+}
+''')
+
+    parts.append(f'const SME_DATA = {sme_json};')
+    parts.append('''
+function smeCardHtml(d) {
+  const lPct = (d.lScore * 100).toFixed(0);
+  const ema20Icon = d.ema20Rising ? '📈 ঊর্ধ্বমুখী' : '📉 নিম্নমুখী';
+  const isNone = d.catcherLevel === 'NONE';
+  const positionClass = isNone ? 'skip' : '';
+  const cardClass = isNone ? 'none' : '';
+  const mcapWarn = d.marketCapMissing ? '<span class="mcap-warn">⚠️ MCap নেই</span>' : '';
+  const fsClass = isNone ? 'none' : '';
+  return '<div class="card ' + cardClass + '"><div class="sme-card-header"><span class="sym">' + esc(d.symbol) + mcapWarn + '</span><span class="price">৳ ' + d.price + '</span></div>' +
+    '<div class="catcher-badge ' + d.catcherCls + '">' + esc(d.catcherBn) + '</div><div class="sum-body">' +
+      '<div class="entry-box"><span class="lbl">🎯 প্রবেশের ধরন</span><span class="val">' + esc(d.entryBn) + '</span></div>' +
+      '<div class="sme-metrics">' +
+        '<div class="sme-metric"><div class="lbl">L_score</div><div class="val green">' + d.lScore + ' (' + d.lScoreBn + ')</div></div>' +
+        '<div class="sme-metric"><div class="lbl">Volume Ratio</div><div class="val">' + d.volumeRatio + 'x</div></div>' +
+        '<div class="sme-metric"><div class="lbl">দাম vs 20 EMA</div><div class="val">' + d.priceVsEma20 + '%</div></div>' +
+        '<div class="sme-metric"><div class="lbl">20 EMA</div><div class="val">' + ema20Icon + '</div></div></div>' +
+      '<div class="sme-score-section"><h4>📊 তরলতার স্কোর</h4>' +
+        '<div class="sme-score-row"><span class="label">L_score</span><div class="bar"><div class="fill" style="width:' + lPct + '%"></div></div><span class="value">' + d.lScore + '</span></div></div>' +
+      '<div class="position-box ' + positionClass + '"><span class="lbl">💰 বিনিয়োগ</span><span class="val">' + esc(d.positionBn) + '</span></div>' +
+      '<div class="sme-final-score ' + fsClass + '"><span class="lbl">📊 Product Score</span><span class="val">' + d.productScore + '</span></div></div></div>';
+}
+function applyFiltersSME() {
+  const s = (document.getElementById('sme_fSearch').value || '').trim().toLowerCase();
+  const c = document.getElementById('sme_fCatcher').value;
+  const e = document.getElementById('sme_fEntry').value;
+  const lMin = parseFloat(document.getElementById('sme_fLMin').value) || 0;
+  const pMin = parseFloat(document.getElementById('sme_fProductMin').value) || 0;
+  const mcap = document.getElementById('sme_fMcap').value;
+  const rows = SME_DATA.filter(function(d) {
+    if (s && d.symbol.toLowerCase().indexOf(s) === -1) return false;
+    if (c !== 'all' && d.catcherLevel !== c) return false;
+    if (e !== 'all' && d.entryType !== e) return false;
+    if (d.lScore < lMin) return false;
+    if (d.productScore < pMin) return false;
+    if (mcap === 'missing' && !d.marketCapMissing) return false;
+    if (mcap === 'ok' && d.marketCapMissing) return false;
+    return true;
+  });
+  rows.sort(function(a,b){ return b.productScore - a.productScore; });
+  document.getElementById('sme_shown').textContent = rows.length;
+  document.getElementById('sme_total').textContent = SME_DATA.length;
+  document.getElementById('smeGrid').innerHTML = rows.length ? rows.map(smeCardHtml).join('') : '<div class="empty"><div class="big">🔍</div>এই শর্তে কোনো স্টক পাওয়া যায়নি।</div>';
+}
+function resetFiltersSME() {
+  document.getElementById('sme_fSearch').value = '';
+  document.getElementById('sme_fCatcher').value = 'all';
+  document.getElementById('sme_fEntry').value = 'all';
+  document.getElementById('sme_fLMin').value = '';
+  document.getElementById('sme_fProductMin').value = '';
+  document.getElementById('sme_fMcap').value = 'all';
+  applyFiltersSME();
+}
+applyFiltersSP();
+applyFiltersHike();
+applyFiltersSummary();
+applyFiltersAB();
+applyFiltersFuzzy();
+applyFiltersSME();
+switchTab('swingparam');
+''')
+    parts.append('</script></body></html>')
+
+    html = ''.join(parts)
     file_name = f"Bangla_All_In_One_{timestamp}.html"
     file_path = os.path.join(BANGLA_DIR, file_name)
     with open(file_path, 'w', encoding='utf-8') as f: f.write(html)
@@ -1610,7 +2568,7 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
 def dump_fuzzy_diagnostics(reports, timestamp):
     rows = []
     for r in reports:
-        try: rows.append({"symbol": str(r.symbol), "asset_class": str(r.asset_class), "price": round(float(r.current_price or 0), 2), "t_stat": round(float(r.mcmc_t_stat or 0), 4), "mu_hat": round(float(r.mcmc_mu or 0), 6), "mu_hat_raw": round(float(r.mcmc_mu_raw or 0), 6), "P_mu": round(float(r.fuzzy_P_mu or 0.5), 4), "M": round(float(r.fuzzy_v3_M or 0), 4), "P": round(float(r.fuzzy_v3_P or 0), 4), "C": round(float(r.fuzzy_v3_C or 0), 4), "C_raw": round(float(r.fuzzy_v3_C_raw or 0), 4), "R": round(float(r.fuzzy_v3_R or 0), 4), "L": round(float(r.fuzzy_v3_L or 0), 4), "S_gate": round(float(r.fuzzy_v3_S_gate or 0), 4), "S_rank": round(float(r.fuzzy_v3_S_rank or 0), 4), "hard_gate_pass": bool(r.fuzzy_v3_hard_gate_pass), "skip_reason": str(r.fuzzy_v3_skip_reason or " "), "fuzzy_action": str(r.fuzzy_Action or " "), "radar_score": int(r.radar_score or 0), "sme_l_score": round(float(r.sme_l_score or 0), 4), "sme_catcher": str(r.sme_catcher_level or "NONE"), "sme_data_health": str(r.sme_data_health or "OK"), "rr_prelim": round(float(r.reward_risk_ratio or 0), 4), "rr_final": round(float(getattr(r, "reward_risk_final", 0) or 0), 4), "ab_rpd_a": round(float(getattr(r, "ab_rpd_a", 0) or 0), 4), "ab_rpd_b": round(float(getattr(r, "ab_rpd_b", 0) or 0), 4), "ab_expected_rpd": round(float(getattr(r, "ab_expected_rpd", 0) or 0), 4), "ab_variant": str(getattr(r, "ab_selected_variant", "NONE") or "NONE"), "ab_confidence": round(float(getattr(r, "ab_confidence_score", 0) or 0), 1), "position_size": int(getattr(r, "ab_position_size", 0) or 0), "final_score": round(float(r.final_score or 0), 4), "final_signal": str(r.final_signal or "WAIT"), "canvas_signal": str(r.canvas_signal or "WAIT"), "hike_tier": str(getattr(r, "hike_tier", TIER_NONE)), "extension_pct": round(float(getattr(r, "extension_pct_from_sma20", 0) or 0), 3), "sma20": round(float(getattr(r, "sma20_value", 0) or 0), 3), "vol_div_days": int(getattr(r, "volume_divergence_days", 0) or 0), "vol_div_total": int(getattr(r, "volume_divergence_total", 0) or 0), "tier_entry_allowed": bool(getattr(r, "hike_tier_entry_allowed", False))})
+        try: rows.append({"symbol": str(r.symbol), "asset_class": str(r.asset_class), "price": round(float(r.current_price or 0), 2), "t_stat": round(float(r.mcmc_t_stat or 0), 4), "mu_hat": round(float(r.mcmc_mu or 0), 6), "M": round(float(r.fuzzy_v3_M or 0), 4), "P": round(float(r.fuzzy_v3_P or 0), 4), "C": round(float(r.fuzzy_v3_C or 0), 4), "R": round(float(r.fuzzy_v3_R or 0), 4), "L": round(float(r.fuzzy_v3_L or 0), 4), "S_gate": round(float(r.fuzzy_v3_S_gate or 0), 4), "S_rank": round(float(r.fuzzy_v3_S_rank or 0), 4), "hard_gate_pass": bool(r.fuzzy_v3_hard_gate_pass), "fuzzy_action": str(r.fuzzy_Action or " "), "radar_score": int(r.radar_score or 0), "sme_l_score": round(float(r.sme_l_score or 0), 4), "sme_catcher": str(r.sme_catcher_level or "NONE"), "final_score": round(float(r.final_score or 0), 4), "final_signal": str(r.final_signal or "WAIT"), "hike_tier": str(getattr(r, "hike_tier", TIER_NONE)), "extension_pct": round(float(getattr(r, "extension_pct_from_sma20", 0) or 0), 3), "vol_div_days": int(getattr(r, "volume_divergence_days", 0) or 0)})
         except Exception as e: rows.append({"symbol": str(getattr(r, "symbol", "UNK")), "error": str(e)})
     pd.DataFrame(rows).to_csv(f"{DIAG_DIR}/fuzzy_diag_{timestamp}.csv", index=False, encoding="utf-8-sig")
     print(f"\n🧪 Fuzzy diagnostic CSV: {DIAG_DIR}/fuzzy_diag_{timestamp}.csv")
@@ -1655,7 +2613,7 @@ def _probe_live_api():
             print(f"   ✅ Live API: {len(df)} symbols returned")
             cols = [c for c in ["code", "ltp", "volume"] if c in df.columns]
             if cols: print(f"   Sample:\n{df.head(3)[cols].to_string(index=False)}")
-        else: print("   ❌ Live API: returned no data (Empty DataFrame)")
+        else: print("   ❌ Live API: returned no data")
     except Exception as e: print(f"   ❌ Live API: Failed with error: {e}")
     print()
 
@@ -1663,27 +2621,29 @@ def _probe_history_sources():
     sym = "BATBC"; end = dt.date.today(); start = end - timedelta(days=60)
     start_str, end_str = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
     print(f"🔎 Probing history sources for {sym} ({start_str} → {end_str}) …")
-    for label, url in [("old.dsebd.org", "https://old.dsebd.org/day_end_archive.php"), ("www.dsebd.org", "https://www.dsebd.org/day_end_archive.php"), ("www.dse.com.bd", "https://www.dse.com.bd/day_end_archive.php")]:
-        try:
-            r = _HTTP.get(url, params={"startDate": start_str, "endDate": end_str, "inst": sym, "archive": "data"})
-            if r and len(r.text) > 500:
-                soup = BeautifulSoup(r.text, "lxml"); tables = soup.find_all("table")
-                print(f"   ✅ {label:<20s}: HTTP 200, {len(tables)} tables")
-            else: print(f"   ⚠️  {label:<20s}: empty/short response")
-        except Exception as e: print(f"   ❌ {label:<20s}: {type(e).__name__}: {str(e)[:60]}")
+    try:
+        df = _HIST_COLLECTOR._from_new_json_api(sym, start_str, end_str)
+        if df is not None and len(df) >= 20: print(f"   ✅ New JSON API: {len(df)} rows")
+        else: print(f"   ⚠️  New JSON API: no rows")
+    except Exception as e: print(f"   ❌ New JSON API: {type(e).__name__}: {str(e)[:60]}")
+    try:
+        df = _HIST_COLLECTOR._from_bdshare(sym, start_str, end_str)
+        if df is not None and len(df) >= 20: print(f"   ✅ bdshare     : {len(df)} rows")
+        else: print(f"   ⚠️  bdshare     : no rows")
+    except Exception as e: print(f"   ❌ bdshare     : {type(e).__name__}: {str(e)[:60]}")
     print()
 
 def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined=True, ab_mode='LONG'):
-    print("\n" + "=" * 80); print(f"📊 CANVAS BATCH SCAN – v1.29 (DSE Archive Fallback + Probes) | Mode: {ab_mode}"); print("=" * 80 + "\n")
-    print("🔄 Prefetching live prices + market data (single API call)...")
+    print("\n" + "=" * 80); print(f"📊 CANVAS BATCH SCAN – v1.31 (JSON API + Weekend Fix) | Mode: {ab_mode}"); print("=" * 80 + "\n")
+    print("🔄 Prefetching live prices + market data ...")
     try: _LIVE_CACHE.prefetch()
-    except Exception: print("⚠️ Prefetch failed, will retry per-symbol.")
+    except Exception: print("⚠️ Prefetch failed.")
     _probe_live_api(); _probe_history_sources()
     stock_list = get_dse_stock_list(force_refresh=False); total = len(stock_list); print(f"📋 Total symbols to scan: {total}\n")
     dsex_series = get_dsex_historical(); breadth = compute_breadth_metrics(); regime = determine_regime(dsex_series)
     vol_label = 'Low' if regime['regime'] in ['Bull', 'Sideways'] else 'High'
     print(f"📈 DSEX Regime: {regime['regime']} (factor {regime['factor']:.2f})"); print(f"📊 Breadth θ: {breadth['theta']:.3f} ({breadth['condition']})"); print(f"⚙️  Max Workers: {MAX_WORKERS}\n")
-    reports = []; failed: List[Dict[str, str]] = []; completed = 0
+    reports = []; failed = []; completed = 0
     temp_csv_path = f"{RESULTS_DIR}/canvas_scan_TEMP_{dt.datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     print("🚀 Starting scan...\n")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
