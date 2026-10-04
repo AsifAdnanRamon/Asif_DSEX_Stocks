@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DSE Canvas Scanner – v1.27
+DSE Canvas Scanner – v1.28
 ================================================================================
-CHANGES FROM v1.26 → v1.27:
+CHANGES FROM v1.27 → v1.28:
 
-  • Failure tracking upgraded from a flat list to reason-classified dicts.
-  • New classify_failure(symbol) helper identifies WHY a stock was skipped:
-        SYMBOL_NOT_FOUND      — not in live /api/live/prices
-        ZERO_PRICE            — live ticker exists but ltp <= 0
-        NO_HISTORY_LOCAL      — no cache CSV, bdshare returned nothing
-        INSUFFICIENT_HISTORY  — data exists but < 20 rows
-        ANALYSIS_ERROR        — historical OK, analysis raised
-        UNKNOWN_ERROR         — anything else
-  • Failure breakdown printed at end of every batch scan.
-  • scan_failures_<timestamp>.csv written to Stock_Report/ for triage.
-  • All other layers identical to v1.26:
+  • NEW: Direct DSE archive scraper as a fallback when bdshare is blocked
+         (HTTP 410). Uses https://www.dse.com.bd/day_end_archive.php which is
+         reachable from GitHub Actions even when bdshare's endpoint is not.
+  • NEW: _append_live_snapshot_to_cache() — every successful live fetch appends
+         today's OHLC bar to historical_cache/<SYM>_archive.csv. Over ~20 trading
+         days this self-heals an empty cache without any manual upload.
+  • NEW: Probe on batch-scan startup — tests BATBC via the DSE archive route so
+         you can see immediately whether the fallback is working.
+  • NEW: BDSHARE_MIN_INTERVAL env-var support for polite pacing.
+  • All other layers identical to v1.27:
         Live     → https://www.dse.com.bd/api/live/prices (cached)
         Market   → https://www.dse.com.bd/api/live/market (cached)
-        History  → bdshare only + local cache
-        Reporting→ 6-tab HTML + main CSV + diagnostics CSV
+        History  → bdshare → DSE archive → local cache
+        Reporting→ 6-tab HTML + main CSV + diagnostics CSV + failure CSV
 ================================================================================
 """
 
@@ -34,6 +33,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 from collections import Counter
 
+
 def install(pkg, extra_args=None):
     args = [sys.executable, "-m", "pip", "install"]
     if extra_args:
@@ -43,6 +43,7 @@ def install(pkg, extra_args=None):
         subprocess.check_call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
+
 
 for pkg in ["pandas", "numpy", "requests", "beautifulsoup4", "lxml", "urllib3", "scipy"]:
     try:
@@ -255,6 +256,7 @@ def compute_data_health(realtime, last_fetch_utc, now=None):
         return "SUSPECT"
     return "STALE"
 
+
 def write_data_health_cache(cache_path: Path, symbol: str, fetch_utc: datetime, source: str = "live") -> None:
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +273,7 @@ def write_data_health_cache(cache_path: Path, symbol: str, fetch_utc: datetime, 
         cache_path.write_text(json.dumps(data, indent=2))
     except Exception:
         pass
+
 
 def read_data_health_cache(cache_path: Path, symbol: str) -> Tuple[Optional[datetime], str]:
     if not cache_path.exists():
@@ -297,9 +300,11 @@ def get_session_minutes_elapsed() -> int:
     start_min = DSE_SESSION_START.hour * 60 + DSE_SESSION_START.minute
     return now_min - start_min
 
+
 def get_session_minutes_total() -> int:
     return ((DSE_SESSION_END.hour * 60 + DSE_SESSION_END.minute)
             - (DSE_SESSION_START.hour * 60 + DSE_SESSION_START.minute))
+
 
 def project_full_day_volume(live_vol: float) -> Tuple[float, str]:
     raw_min = get_session_minutes_elapsed()
@@ -318,6 +323,7 @@ def safe_bool(v):
         return bool(v)
     except Exception: return False
 
+
 def safe_float(v, decimals=4, default=0.0):
     try:
         if v is None: return default
@@ -326,17 +332,20 @@ def safe_float(v, decimals=4, default=0.0):
         return round(f, decimals)
     except Exception: return default
 
+
 def safe_int(v, default=0):
     try:
         if v is None: return default
         return int(v)
     except Exception: return default
 
+
 def safe_str(v, default=''):
     try:
         if v is None: return default
         return str(v)
     except Exception: return default
+
 
 def json_default_handler(obj):
     if isinstance(obj, np.bool_): return bool(obj)
@@ -349,8 +358,10 @@ def json_default_handler(obj):
     if isinstance(obj, (dt.date, dt.datetime)): return obj.isoformat()
     return str(obj)
 
+
 def safe_json_dumps(data, ensure_ascii=False):
     return json.dumps(data, ensure_ascii=False, default=json_default_handler)
+
 
 def get_forecast_thresholds(regime):
     if regime == 'Bull':
@@ -364,11 +375,13 @@ def get_forecast_thresholds(regime):
 DB_PATH = "market_data.db"
 DB_LOCK = threading.Lock()
 
+
 class MarketDatabase:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
         self.conn = None
         self._init_db()
+
     def _init_db(self):
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         c = self.conn.cursor()
@@ -381,6 +394,7 @@ class MarketDatabase:
             vpoc REAL, vah REAL, val REAL,
             PRIMARY KEY (symbol, timestamp))''')
         self.conn.commit()
+
     def save_stock_data(self, symbol, df):
         with DB_LOCK:
             c = self.conn.cursor()
@@ -391,8 +405,10 @@ class MarketDatabase:
                         (symbol,date,open,high,low,close,volume) VALUES (?,?,?,?,?,?,?)''',
                         (symbol, ds, float(row['open']), float(row['high']),
                          float(row['low']), float(row['close']), int(row['volume'])))
-                except Exception: pass
+                except Exception:
+                    pass
             self.conn.commit()
+
     def close(self):
         if self.conn: self.conn.close()
 
@@ -400,6 +416,7 @@ class MarketDatabase:
 # ==================== HTTP SESSION ====================
 SESSION = requests.Session()
 SESSION.verify = False
+
 
 @dataclass
 class DSEConfig:
@@ -447,7 +464,15 @@ class PoliteSession:
         return None
 
 
-_CFG = DSEConfig()
+_cfg_interval = 0.4
+try:
+    _env_interval = os.environ.get("BDSHARE_MIN_INTERVAL")
+    if _env_interval:
+        _cfg_interval = float(_env_interval)
+except Exception:
+    pass
+
+_CFG = DSEConfig(min_request_interval=_cfg_interval)
 _HTTP = PoliteSession(_CFG)
 
 
@@ -458,10 +483,12 @@ try:
 except Exception:
     _BDSHARE_MODULE = None
 
+
 def _bd_fn(name):
     if _BDSHARE_MODULE is None:
         return None
     return getattr(_BDSHARE_MODULE, name, None)
+
 
 _BDSHARE_LIVE           = _bd_fn("get_current_trade_data")
 _BDSHARE_HIST           = _bd_fn("get_historical_data")
@@ -472,7 +499,7 @@ _BDSHARE_MKT_HIST       = _bd_fn("get_market_info")
 _BDSHARE_COMPANY_INFO   = _bd_fn("get_company_info")
 
 if _BDSHARE_MODULE is None:
-    print("⚠️  bdshare not importable — historical data will rely on local cache only.")
+    print("⚠️  bdshare not importable — will use DSE archive + local cache only.")
 else:
     print(f"✅ bdshare loaded (version={getattr(_BDSHARE_MODULE,'__version__','?')}).")
 
@@ -604,7 +631,7 @@ class LiveMarketCache:
 _LIVE_CACHE = LiveMarketCache(_HTTP)
 
 
-# ==================== HISTORICAL DATA (bdshare ONLY) ====================
+# ==================== HISTORICAL DATA (bdshare + DSE archive fallback) ====================
 class HistoricalDataCollector:
     def __init__(self, http: PoliteSession):
         self.http = http
@@ -670,12 +697,73 @@ class HistoricalDataCollector:
                 pass
         return None
 
+    def _from_dse_archive(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """
+        Direct DSE day_end_archive scraper — fallback when bdshare is blocked (HTTP 410).
+        Uses https://www.dse.com.bd/day_end_archive.php — same host as /api/live/prices,
+        which is known to be reachable from GitHub Actions.
+        """
+        url = "https://www.dse.com.bd/day_end_archive.php"
+        params = {
+            "startDate": start_date,
+            "endDate":   end_date,
+            "inst":      symbol.upper(),
+            "archive":   "data",
+        }
+        r = self.http.get(url, params=params)
+        if not r:
+            return None
+        try:
+            soup = BeautifulSoup(r.text, "lxml")
+            for table in soup.find_all("table"):
+                header_cells = table.find_all("th")
+                if not header_cells:
+                    first_tr = table.find("tr")
+                    header_cells = first_tr.find_all("td") if first_tr else []
+                headers = [c.get_text(strip=True).lower() for c in header_cells]
+                if not any("date" in h for h in headers):
+                    continue
+                if not any(("close" in h) or ("ltp" in h) or ("price" in h) for h in headers):
+                    continue
+
+                rows = []
+                for tr in table.find_all("tr")[1:]:
+                    cells = [td.get_text(strip=True).replace(",", "") for td in tr.find_all("td")]
+                    if len(cells) >= len(headers):
+                        rows.append(cells[:len(headers)])
+                if not rows:
+                    continue
+
+                df = pd.DataFrame(rows, columns=headers)
+
+                # Map DSE's column names → our standard names
+                rename = {
+                    "trading code": "symbol", "date": "date",
+                    "open": "open", "high": "high", "low": "low",
+                    "close": "close", "ltp": "close",
+                    "volume": "volume", "trade": "volume",
+                }
+                df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+                out = self._normalize(df, symbol)
+                if out is not None and len(out) >= 20:
+                    return out
+        except Exception:
+            pass
+        return None
+
     def fetch(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         symbol = symbol.upper().strip()
         if symbol in ("DSEX", "DSES", "DS30", "DGEN"):
             return None
         with self._lock:
-            return self._from_bdshare(symbol, start_date, end_date)
+            # 1) Try bdshare (fast when it works).
+            df = self._from_bdshare(symbol, start_date, end_date)
+            if df is not None:
+                return df
+            # 2) Fall back to direct DSE archive.
+            df = self._from_dse_archive(symbol, start_date, end_date)
+            return df
 
 
 _HIST_COLLECTOR = HistoricalDataCollector(_HTTP)
@@ -774,7 +862,8 @@ def save_breadth_data(date, advances, declines):
     ds = date.strftime('%Y-%m-%d')
     ex = [r for r in _BREADTH_HISTORY if r['date'] == ds]
     if ex:
-        ex[0]['advances'] = advances; ex[0]['declines'] = declines
+        ex[0]['advances'] = advances
+        ex[0]['declines'] = declines
     else:
         _BREADTH_HISTORY.append({'date': ds, 'advances': advances, 'declines': declines})
     _BREADTH_HISTORY = sorted(_BREADTH_HISTORY, key=lambda x: x['date'])
@@ -819,7 +908,8 @@ def get_dsex_historical() -> Optional[pd.Series]:
             dsex_col = None
             for c in d.columns:
                 if "dsex" in c.lower():
-                    dsex_col = c; break
+                    dsex_col = c
+                    break
             if dsex_col is None:
                 continue
             out = pd.DataFrame({
@@ -842,7 +932,8 @@ def compute_breadth_metrics():
     h = load_breadth_history()
     if not h or len(h) < 40:
         return {'theta': 0.0, 'mcclellan': 0.0, 'condition': 'Neutral'}
-    df = pd.DataFrame(h); df['date'] = pd.to_datetime(df['date'])
+    df = pd.DataFrame(h)
+    df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
     df['net'] = df['advances'] - df['declines']
     df['ad_line'] = df['net'].cumsum()
@@ -946,6 +1037,7 @@ def get_dse_stock_list(force_refresh: bool = False) -> List[str]:
 _COMPANY_INFO_CACHE: Dict[str, dict] = {}
 _COMPANY_INFO_LOCK = threading.Lock()
 
+
 def parse_company_page(symbol: str) -> Optional[dict]:
     sym = symbol.upper().strip()
     with _COMPANY_INFO_LOCK:
@@ -989,6 +1081,41 @@ def parse_company_page(symbol: str) -> Optional[dict]:
     return info or None
 
 
+# ==================== LIVE SNAPSHOT CACHE APPENDER (v1.28) ====================
+def _append_live_snapshot_to_cache(symbol: str, payload: dict) -> None:
+    """
+    Append today's OHLC from live API into historical_cache/<SYM>_archive.csv.
+    Over ~20 trading days this self-heals an empty cache even without bdshare.
+    """
+    if not payload:
+        return
+    try:
+        price = float(payload.get("close") or payload.get("ltp") or 0)
+        if price <= 0:
+            return
+        row = {
+            "date": pd.to_datetime(payload.get("date") or dt.date.today()),
+            "open": float(payload.get("open") or price),
+            "high": float(payload.get("high") or price),
+            "low":  float(payload.get("low")  or price),
+            "close": price,
+            "volume": int(payload.get("volume") or 0),
+        }
+        cache_file = f"{CACHE_DIR}/{symbol.upper()}_archive.csv"
+        if os.path.exists(cache_file):
+            df = pd.read_csv(cache_file)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            df = df[df["date"].dt.date != row["date"].date()]
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        df = df.sort_values("date").reset_index(drop=True)
+        df.to_csv(cache_file, index=False)
+    except Exception:
+        pass
+
+
 # ==================== REALTIME DATA ====================
 def get_realtime_data(symbol: str) -> Optional[dict]:
     symbol = symbol.upper().strip()
@@ -1003,6 +1130,20 @@ def get_realtime_data(symbol: str) -> Optional[dict]:
                                     datetime.now(timezone.utc), source="live")
         except Exception:
             pass
+
+        # v1.28: append today's bar to historical cache (self-healing)
+        try:
+            _append_live_snapshot_to_cache(symbol, {
+                "date": payload.get("date"),
+                "open": payload.get("open"),
+                "high": payload.get("high"),
+                "low":  payload.get("low"),
+                "close": payload.get("close") or payload.get("ltp"),
+                "volume": vol,
+            })
+        except Exception:
+            pass
+
         return {
             "date": payload.get("date", dt.date.today().strftime("%Y-%m-%d")),
             "open": float(payload.get("open") or 0) or float(payload.get("ltp") or 0),
@@ -1048,12 +1189,14 @@ def load_local_data(symbol):
                 else:
                     for c in df.columns:
                         if 'date' in c.lower():
-                            df['date'] = pd.to_datetime(df[c]); break
-                for col in ['open','high','low','close','volume']:
+                            df['date'] = pd.to_datetime(df[c])
+                            break
+                for col in ['open', 'high', 'low', 'close', 'volume']:
                     if col not in df.columns:
                         for c in df.columns:
                             if col.lower() in c.lower():
-                                df[col] = df[c]; break
+                                df[col] = df[c]
+                                break
                 if 'date' in df.columns and 'close' in df.columns:
                     df = df.sort_values('date').reset_index(drop=True)
                     df = df[df['date'].notna()]
@@ -1071,7 +1214,9 @@ def get_historical_data(symbol, realtime):
     local = load_local_data(symbol)
     if local is not None and len(local) >= 20:
         try:
-            db = MarketDatabase(); db.save_stock_data(symbol, local); db.close()
+            db = MarketDatabase()
+            db.save_stock_data(symbol, local)
+            db.close()
         except Exception:
             pass
         return local
@@ -1103,7 +1248,9 @@ def get_historical_data(symbol, realtime):
             except Exception:
                 pass
             try:
-                db = MarketDatabase(); db.save_stock_data(symbol, df); db.close()
+                db = MarketDatabase()
+                db.save_stock_data(symbol, df)
+                db.close()
             except Exception:
                 pass
             return df
@@ -1114,7 +1261,9 @@ def seed_all_historical_cache():
     symbols = get_dse_stock_list(force_refresh=True)
     total = len(symbols)
     print(f"\n📦 Seeding historical cache for {total} symbols...")
-    cached = 0; failed = 0; already = 0
+    cached = 0
+    failed = 0
+    already = 0
     end = dt.date.today()
     start = end - timedelta(days=2 * 365)
     start_str = start.strftime("%Y-%m-%d")
@@ -1148,16 +1297,13 @@ def seed_all_historical_cache():
     print(f"\n📦 Seeding complete — cached: {cached}, already: {already}, failed: {failed}")
 
 
-# ==================== FAILURE CLASSIFIER (NEW in v1.27) ====================
+# ==================== FAILURE CLASSIFIER ====================
 def classify_failure(symbol: str, exception: Optional[Exception] = None) -> Dict[str, str]:
     """
     Determine WHY a symbol failed. Cheap local checks only — no network.
-
-    Returns dict: {reason, details}
     """
     sym = symbol.upper().strip()
 
-    # Stage 1 — did live data have it?
     live = _LIVE_CACHE.get_symbol(sym)
     if live is None:
         return {
@@ -1171,12 +1317,11 @@ def classify_failure(symbol: str, exception: Optional[Exception] = None) -> Dict
             "details": f"Live ticker exists but ltp={ltp}",
         }
 
-    # Stage 2 — did historical data load?
     hist = load_local_data(sym)
     if hist is None:
         return {
             "reason": "NO_HISTORY_LOCAL",
-            "details": "No cached CSV and bdshare returned nothing",
+            "details": "No cached CSV and history sources returned nothing",
         }
     if len(hist) < 20:
         return {
@@ -1184,7 +1329,6 @@ def classify_failure(symbol: str, exception: Optional[Exception] = None) -> Dict
             "details": f"Only {len(hist)} rows (need >= 20)",
         }
 
-    # Stage 3 — exception during analysis?
     if exception is not None:
         return {
             "reason": "ANALYSIS_ERROR",
@@ -1198,26 +1342,32 @@ def classify_failure(symbol: str, exception: Optional[Exception] = None) -> Dict
 def calculate_rsi(data, period=14):
     if len(data) < period + 1: return 50.0
     delta = data.diff()
-    gain = delta.where(delta > 0, 0); loss = -delta.where(delta < 0, 0)
-    ag = gain.ewm(alpha=1/period, adjust=False).mean()
-    al = loss.ewm(alpha=1/period, adjust=False).mean()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    ag = gain.ewm(alpha=1 / period, adjust=False).mean()
+    al = loss.ewm(alpha=1 / period, adjust=False).mean()
     rs = ag / (al + 1e-9)
     rsi = 100 - (100 / (1 + rs))
     return float(rsi.iloc[-1]) if not rsi.empty else 50.0
+
 
 def calculate_adx(df, period=14):
     if len(df) < period: return 0.0
     high, low, close = df['high'], df['low'], df['close']
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr = tr.rolling(period, min_periods=1).mean()
-    pdm = high.diff(); mdm = low.diff()
-    pdm[pdm < 0] = 0; mdm[mdm > 0] = 0
-    mdm = mdm.abs(); pdm[pdm < mdm] = 0
+    pdm = high.diff()
+    mdm = low.diff()
+    pdm[pdm < 0] = 0
+    mdm[mdm > 0] = 0
+    mdm = mdm.abs()
+    pdm[pdm < mdm] = 0
     pdi = 100 * (pdm.rolling(period, min_periods=1).mean() / (atr + 1e-9))
     mdi = 100 * (mdm.rolling(period, min_periods=1).mean() / (atr + 1e-9))
     dx = (pdi - mdi).abs() / (pdi + mdi + 1e-9) * 100
     adx = dx.rolling(period, min_periods=1).mean()
     return float(adx.iloc[-1]) if not adx.empty else 0.0
+
 
 def calculate_atr(df, period=14):
     if len(df) < period:
@@ -1227,6 +1377,7 @@ def calculate_atr(df, period=14):
                                (df['low'] - df['close'].shift()).abs()))
     atr = tr.rolling(period).mean()
     return float(atr.iloc[-1]) if not atr.empty else float(df['close'].mean() * 0.02)
+
 
 def calculate_macd(data, fast=12, slow=26, signal=9):
     ef = data.ewm(span=fast, adjust=False).mean()
@@ -1249,19 +1400,24 @@ def compute_extension_from_sma20(df: pd.DataFrame, price: float) -> Tuple[float,
     except Exception:
         return 0.0, float(price or 0.0)
 
+
 def compute_volume_divergence_days(df: pd.DataFrame, lookback: int = VOL_DIVERGENCE_LOOKBACK) -> Tuple[int, int]:
     try:
         if df is None or len(df) < 3:
             return 0, 0
         n = min(lookback, len(df) - 1)
-        max_run = 0; cur_run = 0; total = 0
+        max_run = 0
+        cur_run = 0
+        total = 0
         start_idx = len(df) - n
         for i in range(start_idx, len(df)):
-            c = df.iloc[i]; p = df.iloc[i - 1]
+            c = df.iloc[i]
+            p = df.iloc[i - 1]
             up = float(c['close']) > float(p['close'])
             vf = float(c['volume']) < float(p['volume'])
             if up and vf:
-                cur_run += 1; total += 1
+                cur_run += 1
+                total += 1
                 if cur_run > max_run: max_run = cur_run
             else:
                 cur_run = 0
@@ -1290,17 +1446,23 @@ def classify_tier(extension_pct: float, vol_div_days: int,
     elif vd >= VOL_DIVERGENCE_SOFT and rsi_v > VOL_DIVERGENCE_RSI_HOT:
         tier = TIER_EXHAUSTION
     else:
-        if ext < EXTENSION_BAND_NONE:    tier = TIER_NONE
-        elif ext < EXTENSION_BAND_EARLY: tier = TIER_EARLY
-        elif ext < EXTENSION_BAND_MID:   tier = TIER_MID
-        elif ext < EXTENSION_BAND_LATE:  tier = TIER_LATE
-        else:                            tier = TIER_EXHAUSTION
+        if ext < EXTENSION_BAND_NONE:
+            tier = TIER_NONE
+        elif ext < EXTENSION_BAND_EARLY:
+            tier = TIER_EARLY
+        elif ext < EXTENSION_BAND_MID:
+            tier = TIER_MID
+        elif ext < EXTENSION_BAND_LATE:
+            tier = TIER_LATE
+        else:
+            tier = TIER_EXHAUSTION
 
     return HikeClassification(
         tier=tier, extension_pct=ext,
         volume_divergence_days=vd,
         volume_divergence_total=0, rsi=rsi_v,
     )
+
 
 def tier_entry_allowed(tier: str) -> bool:
     return tier in (TIER_EARLY, TIER_MID)
@@ -1318,7 +1480,8 @@ def get_volume_profile(df, bins=None):
         low, high, vol = row['low'], row['high'], row['volume']
         if low == high: continue
         for i in range(bins):
-            bl = pmin + i * width; bh = bl + width
+            bl = pmin + i * width
+            bh = bl + width
             if high >= bl and low <= bh:
                 ov = min(high, bh) - max(low, bl)
                 if ov > 0:
@@ -1329,18 +1492,24 @@ def get_volume_profile(df, bins=None):
     vpoc_idx = max(vbp, key=vbp.get)
     vpoc = pmin + vpoc_idx * width + width / 2
     sb = sorted(vbp.items(), key=lambda x: x[1], reverse=True)
-    cum = 0; vb = []
+    cum = 0
+    vb = []
     for idx, v in sb:
-        vb.append(idx); cum += v
+        vb.append(idx)
+        cum += v
         if cum / tot >= 0.70: break
-    return {'vpoc': vpoc, 'val': pmin + min(vb) * width, 'vah': pmin + (max(vb)+1) * width}
+    return {'vpoc': vpoc, 'val': pmin + min(vb) * width, 'vah': pmin + (max(vb) + 1) * width}
+
 
 def detect_wyckoff_smc(df, vp=None):
     if len(df) < 30: return {'phase': 'Unknown', 'event': 'None', 'bias': 'Neutral'}
     sma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else df['close'].iloc[-1]
     sma200 = df['close'].rolling(200).mean().iloc[-1] if len(df) >= 200 else df['close'].iloc[-1]
-    close = df['close'].iloc[-1]; high = df['high'].iloc[-1]; low = df['low'].iloc[-1]
-    rh = df['high'].tail(20).max(); rl = df['low'].tail(20).min()
+    close = df['close'].iloc[-1]
+    high = df['high'].iloc[-1]
+    low = df['low'].iloc[-1]
+    rh = df['high'].tail(20).max()
+    rl = df['low'].tail(20).min()
     rp = (rh - rl) / close * 100 if close > 0 else 0
     if vp and vp.get('vpoc') is not None:
         vpoc, vah, val = vp['vpoc'], vp['vah'], vp['val']
@@ -1348,26 +1517,35 @@ def detect_wyckoff_smc(df, vp=None):
         vpoc = df['close'].rolling(20).mean().iloc[-1]
         vah = df['high'].tail(20).max() * 0.98
         val = df['low'].tail(20).min() * 1.02
-    ab50 = close > sma50; ab200 = close > sma200
+    ab50 = close > sma50
+    ab200 = close > sma200
     inv = val <= close <= vah if val and vah else False
-    v20 = df['volume'].tail(20).mean(); v50 = df['volume'].tail(50).mean() if len(df) >= 50 else v20
+    v20 = df['volume'].tail(20).mean()
+    v50 = df['volume'].tail(50).mean() if len(df) >= 50 else v20
     vr = v20 / v50 if v50 > 0 else 1
     vdec = vr < 1.0
     lows = df['low'].tail(10).values
-    hl = all(lows[i] < lows[i+1] for i in range(len(lows)-1)) if len(lows) > 1 else False
+    hl = all(lows[i] < lows[i + 1] for i in range(len(lows) - 1)) if len(lows) > 1 else False
     highs = df['high'].tail(10).values
-    lh = all(highs[i] > highs[i+1] for i in range(len(highs)-1)) if len(highs) > 1 else False
+    lh = all(highs[i] > highs[i + 1] for i in range(len(highs) - 1)) if len(highs) > 1 else False
     av = df['volume'].tail(20).mean()
     vs = df['volume'].iloc[-1] / av if av > 0 else 1
     spring = (low < rl * 1.015 and close > low and close > df['low'].tail(10).min() and vs > 1.2)
     utad = (high > rh * 0.985 and close < high and close < df['high'].tail(10).max() and vs > 1.2)
-    if not ab200 and close < sma50 and rp < 12 and vdec: phase, bias = 'Accumulation', 'Bullish'
-    elif not ab200 and close < sma50 and hl and inv: phase, bias = 'Accumulation', 'Bullish'
-    elif ab200 and close > sma50 and rp < 12 and vdec: phase, bias = 'Distribution', 'Bearish'
-    elif ab200 and close > sma50 and lh and inv: phase, bias = 'Distribution', 'Bearish'
-    elif ab200 and close > sma50 and not lh and close > df['close'].tail(5).max(): phase, bias = 'Markup', 'Bullish'
-    elif not ab200 and close < sma50 and not hl and close < df['close'].tail(5).min(): phase, bias = 'Markdown', 'Bearish'
-    else: phase, bias = 'Neutral', 'Neutral'
+    if not ab200 and close < sma50 and rp < 12 and vdec:
+        phase, bias = 'Accumulation', 'Bullish'
+    elif not ab200 and close < sma50 and hl and inv:
+        phase, bias = 'Accumulation', 'Bullish'
+    elif ab200 and close > sma50 and rp < 12 and vdec:
+        phase, bias = 'Distribution', 'Bearish'
+    elif ab200 and close > sma50 and lh and inv:
+        phase, bias = 'Distribution', 'Bearish'
+    elif ab200 and close > sma50 and not lh and close > df['close'].tail(5).max():
+        phase, bias = 'Markup', 'Bullish'
+    elif not ab200 and close < sma50 and not hl and close < df['close'].tail(5).min():
+        phase, bias = 'Markdown', 'Bearish'
+    else:
+        phase, bias = 'Neutral', 'Neutral'
     event = 'None'
     if spring and phase in ['Accumulation', 'Neutral']: event = 'Spring'
     elif utad and phase in ['Distribution', 'Neutral']: event = 'UTAD'
@@ -1375,86 +1553,142 @@ def detect_wyckoff_smc(df, vp=None):
     elif phase == 'Markdown' and close < df['close'].tail(5).min(): event = 'BOS (Down)'
     return {'phase': phase, 'event': event, 'bias': bias, 'vol_spike': vs}
 
+
 def detect_order_flow_signal(df):
     if len(df) < 5: return {'absorption': False, 'initiative': False}
-    last = df.iloc[-1]; prev = df.iloc[-2]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
     av = df['volume'].tail(10).mean()
     ar = (df['high'] - df['low']).tail(10).mean()
     abs_ = (last['volume'] > av * 1.5 and (last['high'] - last['low']) < ar * 0.6)
     sa = abs_ and last['close'] > last['open']
     ba = abs_ and last['close'] < last['open']
     ini = (last['volume'] > av * 1.3 and (last['high'] - last['low']) > ar * 1.2)
-    bi = ini and last['close'] > (last['high'] - (last['high']-last['low'])*0.33)
-    si = ini and last['close'] < (last['low'] + (last['high']-last['low'])*0.33)
+    bi = ini and last['close'] > (last['high'] - (last['high'] - last['low']) * 0.33)
+    si = ini and last['close'] < (last['low'] + (last['high'] - last['low']) * 0.33)
     return {'absorption': abs_, 'sell_absorption': sa, 'buy_absorption': ba,
             'initiative': ini, 'buy_initiative': bi, 'sell_initiative': si}
 
+
 def evaluate_signal(df, realtime, vp, phase, oflow):
     price = realtime.get('close', df['close'].iloc[-1])
-    vpoc = vp.get('vpoc', price); vah = vp.get('vah', price*1.05); val = vp.get('val', price*0.95)
+    vpoc = vp.get('vpoc', price)
+    vah = vp.get('vah', price * 1.05)
+    val = vp.get('val', price * 0.95)
     if phase['phase'] == 'Distribution' and phase['event'] == 'UTAD':
         return {'signal': 'SELL', 'bias': 'Bearish', 'confidence': 75, 'buy_score': 0, 'sell_score': 10,
                 'buy_reasons': [], 'sell_reasons': ['Distribution + UTAD'], 'phase': phase['phase'], 'event': phase['event']}
-    bs = 0; ss = 0; br = []; sr = []
-    if phase['phase'] in ['Accumulation', 'Markup']: bs += 2; br.append('Wyckoff Bullish (+2)')
-    if price <= val * 1.02 or price < vpoc: bs += 1; br.append('Value Zone (+1)')
-    if phase['event'] == 'Spring': bs += 3; br.append('Spring (+3)')
-    elif phase['event'] == 'BOS (Up)': bs += 2; br.append('BOS Up (+2)')
-    if oflow.get('sell_absorption') or oflow.get('buy_initiative'): bs += 2; br.append('Bull Flow (+2)')
+    bs = 0
+    ss = 0
+    br = []
+    sr = []
+    if phase['phase'] in ['Accumulation', 'Markup']:
+        bs += 2
+        br.append('Wyckoff Bullish (+2)')
+    if price <= val * 1.02 or price < vpoc:
+        bs += 1
+        br.append('Value Zone (+1)')
+    if phase['event'] == 'Spring':
+        bs += 3
+        br.append('Spring (+3)')
+    elif phase['event'] == 'BOS (Up)':
+        bs += 2
+        br.append('BOS Up (+2)')
+    if oflow.get('sell_absorption') or oflow.get('buy_initiative'):
+        bs += 2
+        br.append('Bull Flow (+2)')
     last = df.iloc[-1]
-    if last['close'] > last['open'] and (last['close']-last['open']) > (last['high']-last['low'])*0.5:
-        bs += 1; br.append('Bull Candle (+1)')
-    if phase['phase'] in ['Distribution', 'Markdown']: ss += 2; sr.append('Wyckoff Bearish (+2)')
-    if price >= vah * 0.98 or price > vpoc: ss += 1; sr.append('Supply Zone (+1)')
-    if phase['event'] == 'UTAD': ss += 4; sr.append('UTAD (+4)')
-    elif phase['event'] == 'BOS (Down)': ss += 2; sr.append('BOS Down (+2)')
-    if oflow.get('buy_absorption') or oflow.get('sell_initiative'): ss += 2; sr.append('Bear Flow (+2)')
-    if last['close'] < last['open'] and (last['open']-last['close']) > (last['high']-last['low'])*0.5:
-        ss += 1; sr.append('Bear Candle (+1)')
-    if bs >= 5 and bs > ss: sig, bias, conf = 'BUY', 'Bullish', min(85, 50 + bs*5)
-    elif ss >= 5 and ss > bs: sig, bias, conf = 'SELL', 'Bearish', min(85, 50 + ss*5)
-    elif bs >= 3 and ss <= 3: sig, bias, conf = 'BUY (Watch)', 'Bullish', 45 + bs*5
-    elif ss >= 3 and bs <= 3: sig, bias, conf = 'SELL (Watch)', 'Bearish', 45 + ss*5
-    else: sig, bias, conf = 'WAIT', 'Neutral', 30
+    if last['close'] > last['open'] and (last['close'] - last['open']) > (last['high'] - last['low']) * 0.5:
+        bs += 1
+        br.append('Bull Candle (+1)')
+    if phase['phase'] in ['Distribution', 'Markdown']:
+        ss += 2
+        sr.append('Wyckoff Bearish (+2)')
+    if price >= vah * 0.98 or price > vpoc:
+        ss += 1
+        sr.append('Supply Zone (+1)')
+    if phase['event'] == 'UTAD':
+        ss += 4
+        sr.append('UTAD (+4)')
+    elif phase['event'] == 'BOS (Down)':
+        ss += 2
+        sr.append('BOS Down (+2)')
+    if oflow.get('buy_absorption') or oflow.get('sell_initiative'):
+        ss += 2
+        sr.append('Bear Flow (+2)')
+    if last['close'] < last['open'] and (last['open'] - last['close']) > (last['high'] - last['low']) * 0.5:
+        ss += 1
+        sr.append('Bear Candle (+1)')
+    if bs >= 5 and bs > ss:
+        sig, bias, conf = 'BUY', 'Bullish', min(85, 50 + bs * 5)
+    elif ss >= 5 and ss > bs:
+        sig, bias, conf = 'SELL', 'Bearish', min(85, 50 + ss * 5)
+    elif bs >= 3 and ss <= 3:
+        sig, bias, conf = 'BUY (Watch)', 'Bullish', 45 + bs * 5
+    elif ss >= 3 and bs <= 3:
+        sig, bias, conf = 'SELL (Watch)', 'Bearish', 45 + ss * 5
+    else:
+        sig, bias, conf = 'WAIT', 'Neutral', 30
     return {'signal': sig, 'bias': bias, 'confidence': conf, 'buy_score': bs, 'sell_score': ss,
             'buy_reasons': br, 'sell_reasons': sr, 'phase': phase['phase'], 'event': phase['event']}
+
 
 def get_dynamic_stop(df, price, is_long=True):
     atr = calculate_atr(df)
     if is_long:
-        s = max(price - atr*2.0, df['low'].tail(5).min()*0.98 if len(df) >= 5 else price*0.95)
-        return max(s, price*0.95)
-    s = min(price + atr*2.0, df['high'].tail(5).max()*1.02 if len(df) >= 5 else price*1.05)
-    return min(s, price*1.05)
+        s = max(price - atr * 2.0, df['low'].tail(5).min() * 0.98 if len(df) >= 5 else price * 0.95)
+        return max(s, price * 0.95)
+    s = min(price + atr * 2.0, df['high'].tail(5).max() * 1.02 if len(df) >= 5 else price * 1.05)
+    return min(s, price * 1.05)
 
 
 # ==================== RADAR ====================
 def compute_radar_score(df, realtime, rsi, adx, macd_hist):
     if df is None or len(df) < 60: return 0, '', 0.0
-    score = 0; flags = []
+    score = 0
+    flags = []
     close = float(df['close'].iloc[-1])
     vol = float(realtime.get('volume', 0) or 0)
     turnover = close * vol
     v20 = float(df['volume'].tail(20).mean()) if len(df) >= 20 else 0.0
     v50 = float(df['volume'].tail(50).mean()) if len(df) >= 50 else v20
     h20 = float(df['high'].tail(20).max()) if len(df) >= 20 else close
-    ma20 = df['close'].rolling(20).mean(); sd20 = df['close'].rolling(20).std()
-    bb = float((sd20.iloc[-1]*4) / ma20.iloc[-1]) if ma20.iloc[-1] else 0.0
-    if bb < RADAR_SQUEEZE_BB: score += 1; flags.append('BB_SQUEEZE')
-    if v50 > 0 and v20 < RADAR_DRYUP_FACTOR * v50: score += 1; flags.append('VOL_DRYUP')
-    if h20 > 0 and close >= RADAR_NEAR_HIGH_FACTOR * h20: score += 1; flags.append('NEAR_HIGH')
-    if RADAR_RSI_LOW <= rsi <= RADAR_RSI_HIGH: score += 1; flags.append('RSI_ZONE')
+    ma20 = df['close'].rolling(20).mean()
+    sd20 = df['close'].rolling(20).std()
+    bb = float((sd20.iloc[-1] * 4) / ma20.iloc[-1]) if ma20.iloc[-1] else 0.0
+    if bb < RADAR_SQUEEZE_BB:
+        score += 1
+        flags.append('BB_SQUEEZE')
+    if v50 > 0 and v20 < RADAR_DRYUP_FACTOR * v50:
+        score += 1
+        flags.append('VOL_DRYUP')
+    if h20 > 0 and close >= RADAR_NEAR_HIGH_FACTOR * h20:
+        score += 1
+        flags.append('NEAR_HIGH')
+    if RADAR_RSI_LOW <= rsi <= RADAR_RSI_HIGH:
+        score += 1
+        flags.append('RSI_ZONE')
     if len(df) > 25:
         ap = calculate_adx(df.iloc[:-5])
-        if adx > ap: score += 1; flags.append('ADX_RISING')
+        if adx > ap:
+            score += 1
+            flags.append('ADX_RISING')
     if macd_hist is not None and len(macd_hist) > 5 and macd_hist.iloc[-1] > macd_hist.iloc[-5]:
-        score += 1; flags.append('MACD_TURN')
+        score += 1
+        flags.append('MACD_TURN')
     obv = (np.sign(df['close'].diff()).fillna(0) * df['volume']).cumsum()
-    if len(obv) > 10 and obv.iloc[-1] > obv.iloc[-10]: score += 1; flags.append('OBV_RISING')
-    if ma20.iloc[-1] and close > ma20.iloc[-1]: score += 1; flags.append('ABOVE_MA20')
+    if len(obv) > 10 and obv.iloc[-1] > obv.iloc[-10]:
+        score += 1
+        flags.append('OBV_RISING')
+    if ma20.iloc[-1] and close > ma20.iloc[-1]:
+        score += 1
+        flags.append('ABOVE_MA20')
     if v50 > 0 and vol > RADAR_VOL_IGNITION_MULT * v50 and turnover >= RADAR_MIN_TURNOVER:
-        score += 2; flags.append('VOL_IGNITION')
-    if turnover >= RADAR_MIN_TURNOVER: score += 1; flags.append('LIQ_OK')
+        score += 2
+        flags.append('VOL_IGNITION')
+    if turnover >= RADAR_MIN_TURNOVER:
+        score += 1
+        flags.append('LIQ_OK')
     return score, ','.join(flags), turnover
 
 
@@ -1463,8 +1697,8 @@ def compute_mcmc(symbol, df, current_price, dsex=None):
     vd = df[df['volume'] > 0].copy()
     if len(vd) < 20:
         return {'quality': 'INVALID', 'mu_hat': 0.0, 'mu_hat_raw': 0.0,
-                'sigma_adapt': 0.02, 'buy_zone': current_price*0.98,
-                'target': current_price*1.02, 'stop': current_price*0.95,
+                'sigma_adapt': 0.02, 'buy_zone': current_price * 0.98,
+                'target': current_price * 1.02, 'stop': current_price * 0.95,
                 't_stat': 0.0, 'avg_turnover': 0.0, 'n_eff': 0,
                 'signal': 'WAIT', 'P_mu': 0.5}
     vd['r'] = np.log(vd['close'] / vd['open'])
@@ -1472,16 +1706,19 @@ def compute_mcmc(symbol, df, current_price, dsex=None):
     N = len(rs)
     if N < 5:
         return {'quality': 'INVALID', 'mu_hat': 0.0, 'mu_hat_raw': 0.0,
-                'sigma_adapt': 0.02, 'buy_zone': current_price*0.98,
-                'target': current_price*1.02, 'stop': current_price*0.95,
+                'sigma_adapt': 0.02, 'buy_zone': current_price * 0.98,
+                'target': current_price * 1.02, 'stop': current_price * 0.95,
                 't_stat': 0.0, 'avg_turnover': 0.0, 'n_eff': 0,
                 'signal': 'WAIT', 'P_mu': 0.5}
     if dsex is not None and len(dsex) >= 252:
         dr = np.log(dsex / dsex.shift(1)).dropna()
         if len(dr) >= 252:
-            mu_0 = dr.iloc[-252:].mean(); s0sq = dr.iloc[-252:].var()
-        else: mu_0, s0sq = 0.0, 0.01
-    else: mu_0, s0sq = 0.0, 0.01
+            mu_0 = dr.iloc[-252:].mean()
+            s0sq = dr.iloc[-252:].var()
+        else:
+            mu_0, s0sq = 0.0, 0.01
+    else:
+        mu_0, s0sq = 0.0, 0.01
     Nw = min(60, max(20, N))
     rw = rs.iloc[-Nw:] if N >= Nw else rs
     neff = len(rw)
@@ -1530,7 +1767,7 @@ def compute_forecast_1w(price, mcmc_mu, mcmc_t_stat, mcmc_sigma, volume_conf, ve
     T_TRADE, BAND_TRADE = th['T_TRADE'], th['BAND_TRADE']
     T_WATCH, BAND_WATCH = th['T_WATCH'], th['BAND_WATCH']
     BS = BAND_WATCH * BAND_SOFT_WATCH_FACTOR
-    t_sq = mcmc_t_stat**2
+    t_sq = mcmc_t_stat ** 2
     denom = t_sq + SHRINK_K
     mu_shrunk = (mcmc_mu * t_sq / denom) if denom > 0 else 0.0
     r_mid = TRADING_DAYS_1W * mu_shrunk
@@ -1538,15 +1775,19 @@ def compute_forecast_1w(price, mcmc_mu, mcmc_t_stat, mcmc_sigma, volume_conf, ve
     band_80 = Z_80 * sigma_1w
     if use_simplified or abs(mcmc_t_stat) < 1.8:
         P_mid = price
-        P_low = price * (1.0 - Z_80*mcmc_sigma*math.sqrt(TRADING_DAYS_1W))
-        P_high = price * (1.0 + Z_80*mcmc_sigma*math.sqrt(TRADING_DAYS_1W))
-        bw = ((P_high - P_low)/price*100.0) if price > 0 else 0.0
-        r_eff = 0.0; ver = 'SIMPLIFIED'
+        P_low = price * (1.0 - Z_80 * mcmc_sigma * math.sqrt(TRADING_DAYS_1W))
+        P_high = price * (1.0 + Z_80 * mcmc_sigma * math.sqrt(TRADING_DAYS_1W))
+        bw = ((P_high - P_low) / price * 100.0) if price > 0 else 0.0
+        r_eff = 0.0
+        ver = 'SIMPLIFIED'
     else:
         rl, rh = r_mid - band_80, r_mid + band_80
-        P_low = price*(1+rl); P_mid = price*(1+r_mid); P_high = price*(1+rh)
-        bw = ((P_high - P_low)/price*100.0) if price > 0 else 0.0
-        r_eff = r_mid; ver = 'DRIFT'
+        P_low = price * (1 + rl)
+        P_mid = price * (1 + r_mid)
+        P_high = price * (1 + rh)
+        bw = ((P_high - P_low) / price * 100.0) if price > 0 else 0.0
+        r_eff = r_mid
+        ver = 'DRIFT'
     sig, reason = 'IGNORE', 'Conditions not met'
     if volume_conf > VOLUME_CONF_CORRUPT:
         sig, reason = 'REJECT', f'Vol {volume_conf:.1f}x > {VOLUME_CONF_CORRUPT:.0f}'
@@ -1557,20 +1798,30 @@ def compute_forecast_1w(price, mcmc_mu, mcmc_t_stat, mcmc_sigma, volume_conf, ve
         sig, reason = 'TRADE', 'All TRADE conditions met'
     elif (mcmc_t_stat >= T_WATCH and bw <= BAND_WATCH and avg_turnover >= LIQ_WATCH_TIER):
         sig = 'WATCH'
-        if verdict == 'RED': reason = 'Verdict=RED'
-        elif weinstein_stage2 != 'YES': reason = 'Not Stage 2'
-        elif bw > BAND_TRADE: reason = f'Band {bw:.1f}% > {BAND_TRADE:.1f}%'
-        elif avg_turnover < LIQ_TRADE_TIER: reason = f'Turnover low'
-        elif mcmc_t_stat < T_TRADE: reason = f't {mcmc_t_stat:.2f} < {T_TRADE}'
-        else: reason = 'Conditions not met'
+        if verdict == 'RED':
+            reason = 'Verdict=RED'
+        elif weinstein_stage2 != 'YES':
+            reason = 'Not Stage 2'
+        elif bw > BAND_TRADE:
+            reason = f'Band {bw:.1f}% > {BAND_TRADE:.1f}%'
+        elif avg_turnover < LIQ_TRADE_TIER:
+            reason = f'Turnover low'
+        elif mcmc_t_stat < T_TRADE:
+            reason = f't {mcmc_t_stat:.2f} < {T_TRADE}'
+        else:
+            reason = 'Conditions not met'
     elif (mcmc_t_stat >= T_WATCH and weinstein_stage2 == 'YES' and bw <= BS
           and avg_turnover >= LIQ_WATCH_TIER and a_mqs >= A_MQS_SOFT_WATCH):
-        sig = 'WATCH'; reason = f'Soft WATCH (Stage2+aMQS)'
+        sig = 'WATCH'
+        reason = f'Soft WATCH (Stage2+aMQS)'
     else:
         sig = 'IGNORE'
-        if mcmc_t_stat < T_WATCH: reason = f't {mcmc_t_stat:.2f} < {T_WATCH}'
-        elif bw > BAND_WATCH: reason = f'Band {bw:.1f}% > {BAND_WATCH:.0f}%'
-        elif verdict == 'RED': reason = 'Verdict RED'
+        if mcmc_t_stat < T_WATCH:
+            reason = f't {mcmc_t_stat:.2f} < {T_WATCH}'
+        elif bw > BAND_WATCH:
+            reason = f'Band {bw:.1f}% > {BAND_WATCH:.0f}%'
+        elif verdict == 'RED':
+            reason = 'Verdict RED'
     return {'mu_shrunk': mu_shrunk, 'r_mid': r_mid, 'r_mid_effective': r_eff,
             'sigma_1w': sigma_1w, 'band_80': band_80,
             'P_low': P_low, 'P_mid': P_mid, 'P_high': P_high,
@@ -1619,9 +1870,12 @@ def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor,
             return f
         except (TypeError, ValueError):
             return default
+
     def _clip(v, lo=0.0, hi=1.0):
-        try: return max(lo, min(hi, float(v)))
-        except Exception: return lo
+        try:
+            return max(lo, min(hi, float(v)))
+        except Exception:
+            return lo
 
     price_vs_ema20 = _f(price_vs_ema20, 0.0)
     volume_ratio   = _f(volume_ratio, 1.0)
@@ -1666,7 +1920,8 @@ def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor,
 
     data_missing = free_float_cap < 1_000_000.0
     if data_missing:
-        L = 0.45; turnover_velocity = 0.0
+        L = 0.45
+        turnover_velocity = 0.0
     else:
         turnover_velocity = turnover / free_float_cap if free_float_cap > 0 else 0.0
         L = _clip(turnover_velocity / tv_ref, 0.20, 1.0)
@@ -1676,15 +1931,20 @@ def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor,
     m_close = close_position
     m_rsi   = _clip((rsi - 30.0) / 40.0)
     m_adx   = _clip((adx - 15.0) / 25.0)
-    M = _clip(0.30*m_price + 0.25*m_vol + 0.20*m_close + 0.15*m_rsi + 0.10*m_adx)
+    M = _clip(0.30 * m_price + 0.25 * m_vol + 0.20 * m_close + 0.15 * m_rsi + 0.10 * m_adx)
 
     bull = [p for p in patterns if isinstance(p, dict) and p.get('direction') == 'bullish']
     P = 0.0
-    if any(p.get('tier') == 1 for p in bull): P = 0.90
-    elif any(p.get('tier') == 2 for p in bull): P = 0.65
-    elif bull: P = 0.40
-    if close_position >= CLOSE_POS_MIN_LAUNCH and volume_ratio >= 1.5: P = max(P, 0.75)
-    if -3.0 < price_vs_ema20 < 2.0 and close_position <= 0.40: P = max(P, 0.55)
+    if any(p.get('tier') == 1 for p in bull):
+        P = 0.90
+    elif any(p.get('tier') == 2 for p in bull):
+        P = 0.65
+    elif bull:
+        P = 0.40
+    if close_position >= CLOSE_POS_MIN_LAUNCH and volume_ratio >= 1.5:
+        P = max(P, 0.75)
+    if -3.0 < price_vs_ema20 < 2.0 and close_position <= 0.40:
+        P = max(P, 0.55)
     P = _clip(P)
 
     t_eff = max(t_stat, 0.0)
@@ -1694,7 +1954,7 @@ def compute_fuzzy_v3(df, mcmc, patterns, breadth_theta, regime_factor,
         C_raw = 1.0
     C = _clip(0.60 * C_raw + 0.40 * p_up)
 
-    R = _clip(0.40 + 0.40*breadth_theta + 0.20*regime_factor, 0.20, 1.0)
+    R = _clip(0.40 + 0.40 * breadth_theta + 0.20 * regime_factor, 0.20, 1.0)
 
     if L >= FUZZY_V3_L_FLOOR:
         L_eff = L
@@ -1791,6 +2051,7 @@ def rank_ab_candidates(reports, equity=120000.0, min_fuzzy=AB_MIN_FUZZY_FOR_RANK
             return f
         except (TypeError, ValueError):
             return default
+
     if not isinstance(reports, (list, tuple)) or len(reports) == 0:
         return []
     equity = max(1.0, _f(equity, 120000.0))
@@ -1867,107 +2128,143 @@ class CandleDetector:
     def _r(self, c): return c['high'] - c['low']
     def _is_bull(self, c): return c['close'] > c['open']
     def _is_bear(self, c): return c['close'] < c['open']
+
     def detect_doji(self, df, i):
-        c = df.iloc[i]; b = self._b(c); r = self._r(c)
-        if r > 0 and b/r < 0.1:
-            u = self._u(c); l = self._l(c)
-            if u > 0 and l > 0: return {'name':'Long-Legged Doji','direction':'neutral','tier':3}
-            if u > b*2: return {'name':'Gravestone Doji','direction':'bearish','tier':2}
-            if l > b*2: return {'name':'Dragonfly Doji','direction':'bullish','tier':1}
-            return {'name':'Doji','direction':'neutral','tier':2}
+        c = df.iloc[i]
+        b = self._b(c)
+        r = self._r(c)
+        if r > 0 and b / r < 0.1:
+            u = self._u(c)
+            l = self._l(c)
+            if u > 0 and l > 0: return {'name': 'Long-Legged Doji', 'direction': 'neutral', 'tier': 3}
+            if u > b * 2: return {'name': 'Gravestone Doji', 'direction': 'bearish', 'tier': 2}
+            if l > b * 2: return {'name': 'Dragonfly Doji', 'direction': 'bullish', 'tier': 1}
+            return {'name': 'Doji', 'direction': 'neutral', 'tier': 2}
         return None
+
     def detect_hammer(self, df, i):
         if i < 1: return None
         c = df.iloc[i]
-        if self._l(c) > self._b(c)*2 and self._u(c) < self._b(c)*0.5:
-            return {'name':'Hammer','direction':'bullish','tier':1}
+        if self._l(c) > self._b(c) * 2 and self._u(c) < self._b(c) * 0.5:
+            return {'name': 'Hammer', 'direction': 'bullish', 'tier': 1}
         return None
+
     def detect_shooting_star(self, df, i):
         if i < 1: return None
         c = df.iloc[i]
-        if self._u(c) > self._b(c)*2 and self._l(c) < self._b(c)*0.5:
-            return {'name':'Shooting Star','direction':'bearish','tier':2}
+        if self._u(c) > self._b(c) * 2 and self._l(c) < self._b(c) * 0.5:
+            return {'name': 'Shooting Star', 'direction': 'bearish', 'tier': 2}
         return None
+
     def detect_engulfing_bull(self, df, i):
         if i < 1: return None
-        c = df.iloc[i]; p = df.iloc[i-1]
+        c = df.iloc[i]
+        p = df.iloc[i - 1]
         if self._is_bear(p) and self._is_bull(c) and c['close'] > p['open'] and c['open'] < p['close']:
-            return {'name':'Bullish Engulfing','direction':'bullish','tier':1}
+            return {'name': 'Bullish Engulfing', 'direction': 'bullish', 'tier': 1}
         return None
+
     def detect_engulfing_bear(self, df, i):
         if i < 1: return None
-        c = df.iloc[i]; p = df.iloc[i-1]
+        c = df.iloc[i]
+        p = df.iloc[i - 1]
         if self._is_bull(p) and self._is_bear(c) and c['close'] < p['open'] and c['open'] > p['close']:
-            return {'name':'Bearish Engulfing','direction':'bearish','tier':1}
+            return {'name': 'Bearish Engulfing', 'direction': 'bearish', 'tier': 1}
         return None
+
     def detect_piercing(self, df, i):
         if i < 1: return None
-        c = df.iloc[i]; p = df.iloc[i-1]
+        c = df.iloc[i]
+        p = df.iloc[i - 1]
         if self._is_bear(p) and self._is_bull(c):
-            if c['open'] < p['close'] and c['close'] > (p['open']+p['close'])/2 and c['close'] < p['open']:
-                return {'name':'Piercing Line','direction':'bullish','tier':1}
+            if c['open'] < p['close'] and c['close'] > (p['open'] + p['close']) / 2 and c['close'] < p['open']:
+                return {'name': 'Piercing Line', 'direction': 'bullish', 'tier': 1}
         return None
+
     def detect_dark_cloud(self, df, i):
         if i < 1: return None
-        c = df.iloc[i]; p = df.iloc[i-1]
+        c = df.iloc[i]
+        p = df.iloc[i - 1]
         if self._is_bull(p) and self._is_bear(c):
-            if c['open'] > p['close'] and c['close'] < (p['open']+p['close'])/2 and c['close'] > p['open']:
-                return {'name':'Dark Cloud','direction':'bearish','tier':1}
+            if c['open'] > p['close'] and c['close'] < (p['open'] + p['close']) / 2 and c['close'] > p['open']:
+                return {'name': 'Dark Cloud', 'direction': 'bearish', 'tier': 1}
         return None
+
     def detect_harami_bull(self, df, i):
         if i < 1: return None
-        c = df.iloc[i]; p = df.iloc[i-1]
+        c = df.iloc[i]
+        p = df.iloc[i - 1]
         if self._is_bear(p) and self._is_bull(c) and c['open'] > p['close'] and c['close'] < p['open']:
-            return {'name':'Bullish Harami','direction':'bullish','tier':2}
+            return {'name': 'Bullish Harami', 'direction': 'bullish', 'tier': 2}
         return None
+
     def detect_harami_bear(self, df, i):
         if i < 1: return None
-        c = df.iloc[i]; p = df.iloc[i-1]
+        c = df.iloc[i]
+        p = df.iloc[i - 1]
         if self._is_bull(p) and self._is_bear(c) and c['open'] < p['close'] and c['close'] > p['open']:
-            return {'name':'Bearish Harami','direction':'bearish','tier':2}
+            return {'name': 'Bearish Harami', 'direction': 'bearish', 'tier': 2}
         return None
+
     def detect_marubozu(self, df, i):
-        c = df.iloc[i]; b = self._b(c); r = self._r(c)
-        if r > 0 and b/r > 0.9:
-            if self._is_bull(c): return {'name':'White Marubozu','direction':'bullish','tier':1}
-            return {'name':'Black Marubozu','direction':'bearish','tier':1}
+        c = df.iloc[i]
+        b = self._b(c)
+        r = self._r(c)
+        if r > 0 and b / r > 0.9:
+            if self._is_bull(c): return {'name': 'White Marubozu', 'direction': 'bullish', 'tier': 1}
+            return {'name': 'Black Marubozu', 'direction': 'bearish', 'tier': 1}
         return None
+
     def detect_morning_star(self, df, i):
         if i < 2: return None
-        c1 = df.iloc[i-2]; c2 = df.iloc[i-1]; c3 = df.iloc[i]
+        c1 = df.iloc[i - 2]
+        c2 = df.iloc[i - 1]
+        c3 = df.iloc[i]
         if self._is_bear(c1) and self._is_bull(c3):
-            b2 = self._b(c2); r2 = self._r(c2)
-            if r2 > 0 and b2/r2 < 0.3:
-                if c3['close'] > (c1['open']+c1['close'])/2 and c2['high'] < c1['close']:
-                    return {'name':'Morning Star','direction':'bullish','tier':1}
+            b2 = self._b(c2)
+            r2 = self._r(c2)
+            if r2 > 0 and b2 / r2 < 0.3:
+                if c3['close'] > (c1['open'] + c1['close']) / 2 and c2['high'] < c1['close']:
+                    return {'name': 'Morning Star', 'direction': 'bullish', 'tier': 1}
         return None
+
     def detect_evening_star(self, df, i):
         if i < 2: return None
-        c1 = df.iloc[i-2]; c2 = df.iloc[i-1]; c3 = df.iloc[i]
+        c1 = df.iloc[i - 2]
+        c2 = df.iloc[i - 1]
+        c3 = df.iloc[i]
         if self._is_bull(c1) and self._is_bear(c3):
-            b2 = self._b(c2); r2 = self._r(c2)
-            if r2 > 0 and b2/r2 < 0.3:
-                if c3['close'] < (c1['open']+c1['close'])/2 and c2['low'] > c1['close']:
-                    return {'name':'Evening Star','direction':'bearish','tier':1}
+            b2 = self._b(c2)
+            r2 = self._r(c2)
+            if r2 > 0 and b2 / r2 < 0.3:
+                if c3['close'] < (c1['open'] + c1['close']) / 2 and c2['low'] > c1['close']:
+                    return {'name': 'Evening Star', 'direction': 'bearish', 'tier': 1}
         return None
+
     def detect_three_white_soldiers(self, df, i):
         if i < 2: return None
-        c1 = df.iloc[i-2]; c2 = df.iloc[i-1]; c3 = df.iloc[i]
+        c1 = df.iloc[i - 2]
+        c2 = df.iloc[i - 1]
+        c3 = df.iloc[i]
         if self._is_bull(c1) and self._is_bull(c2) and self._is_bull(c3):
             if c2['close'] > c1['close'] and c3['close'] > c2['close']:
-                if (self._u(c1) < self._b(c1)*0.3 and self._u(c2) < self._b(c2)*0.3 and
-                    self._u(c3) < self._b(c3)*0.3):
-                    return {'name':'Three White Soldiers','direction':'bullish','tier':1}
+                if (self._u(c1) < self._b(c1) * 0.3 and self._u(c2) < self._b(c2) * 0.3 and
+                        self._u(c3) < self._b(c3) * 0.3):
+                    return {'name': 'Three White Soldiers', 'direction': 'bullish', 'tier': 1}
         return None
+
     def detect_three_black_crows(self, df, i):
         if i < 2: return None
-        c1 = df.iloc[i-2]; c2 = df.iloc[i-1]; c3 = df.iloc[i]
+        c1 = df.iloc[i - 2]
+        c2 = df.iloc[i - 1]
+        c3 = df.iloc[i]
         if self._is_bear(c1) and self._is_bear(c2) and self._is_bear(c3):
             if c2['close'] < c1['close'] and c3['close'] < c2['close']:
-                if (self._l(c1) < self._b(c1)*0.3 and self._l(c2) < self._b(c2)*0.3 and
-                    self._l(c3) < self._b(c3)*0.3):
-                    return {'name':'Three Black Crows','direction':'bearish','tier':1}
+                if (self._l(c1) < self._b(c1) * 0.3 and self._l(c2) < self._b(c2) * 0.3 and
+                        self._l(c3) < self._b(c3) * 0.3):
+                    return {'name': 'Three Black Crows', 'direction': 'bearish', 'tier': 1}
         return None
+
     def detect_all_patterns(self, df, window_size=10):
         patterns = []
         start = max(0, len(df) - window_size)
@@ -2133,12 +2430,12 @@ class StockAnalysisReport:
 def _classify_asset(symbol: str) -> str:
     s = (symbol or " ").upper()
     if any(tag in s for tag in ("MUTUAL", "1STMF", "2NDMF", "3RDNRB", "1STICB",
-                                  "GROWTH", "GREEN", "GREENMF", "POPULAR1", "TRUSTB1",
-                                  "PRIME1ICBA", "LRGLOBMF", "IFILISLMF", "IFIC1STMF",
-                                  "ICBEPMF", "ICBAMCL", "ICBAGRANI", "ICBSONALI",
-                                  "PHPMF1", "MBL1STMF", "NCCBLMF", "EBLNRBMF",
-                                  "EBL1STMF", "DBH1STMF", "EXIM1STMF", "ABB1STMF",
-                                  "AIBL1STIMF", "PF1STMF", "CSE1STMF")):
+                                 "GROWTH", "GREEN", "GREENMF", "POPULAR1", "TRUSTB1",
+                                 "PRIME1ICBA", "LRGLOBMF", "IFILISLMF", "IFIC1STMF",
+                                 "ICBEPMF", "ICBAMCL", "ICBAGRANI", "ICBSONALI",
+                                 "PHPMF1", "MBL1STMF", "NCCBLMF", "EBLNRBMF",
+                                 "EBL1STMF", "DBH1STMF", "EXIM1STMF", "ABB1STMF",
+                                 "AIBL1STIMF", "PF1STMF", "CSE1STMF")):
         return "MF"
     return "EQ"
 
@@ -2153,18 +2450,22 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
 
     if 'RSI_14' not in df.columns or 'ADX' not in df.columns:
         delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0); loss = -delta.where(delta < 0, 0)
-        ag = gain.ewm(alpha=1/14, adjust=False).mean()
-        al = loss.ewm(alpha=1/14, adjust=False).mean()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        ag = gain.ewm(alpha=1 / 14, adjust=False).mean()
+        al = loss.ewm(alpha=1 / 14, adjust=False).mean()
         rs = ag / (al + 1e-9)
-        df['RSI_14'] = 100 - (100/(1+rs))
+        df['RSI_14'] = 100 - (100 / (1 + rs))
         high, low, close = df['high'], df['low'], df['close']
-        tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()],
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
                        axis=1).max(axis=1)
         atr_s = tr.rolling(14, min_periods=1).mean()
-        pdm = high.diff(); mdm = low.diff()
-        pdm[pdm < 0] = 0; mdm[mdm > 0] = 0
-        mdm = mdm.abs(); pdm[pdm < mdm] = 0
+        pdm = high.diff()
+        mdm = low.diff()
+        pdm[pdm < 0] = 0
+        mdm[mdm > 0] = 0
+        mdm = mdm.abs()
+        pdm[pdm < mdm] = 0
         pdi = 100 * (pdm.rolling(14, min_periods=1).mean() / (atr_s + 1e-9))
         mdi = 100 * (mdm.rolling(14, min_periods=1).mean() / (atr_s + 1e-9))
         dx = (pdi - mdi).abs() / (pdi + mdi + 1e-9) * 100
@@ -2195,7 +2496,8 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
 
     risk = current_price - final_stop
     if risk <= 0:
-        risk = current_price * 0.05; final_stop = current_price - risk
+        risk = current_price * 0.05
+        final_stop = current_price - risk
     target_atr = current_price + ATR_TP2_MULT * atr
     rr_prelim = (target_atr - current_price) / risk if risk > 0 else 0.0
     rr = rr_prelim
@@ -2206,7 +2508,7 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     weekly_aligned = False
     if len(df) >= 30:
         weekly = df.resample('W-FRI', on='date').agg({
-            'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
         if len(weekly) >= 10:
             weekly_aligned = weekly['close'].iloc[-1] > weekly['close'].ewm(span=20).mean().iloc[-1]
 
@@ -2214,9 +2516,9 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     ag_ = df['close'].diff().where(df['close'].diff() > 0, 0).rolling(14).mean().iloc[-1]
     al_ = -df['close'].diff().where(df['close'].diff() < 0, 0).rolling(14).mean().iloc[-1]
     gl = ag_ / (al_ + 1e-9)
-    vt = 1.0 if df['volume'].tail(20).mean() > df['volume'].tail(40).head(20).mean()*1.05 else 0.5
-    raw = green_days*0.4 + min(gl, 2.0)*0.3 + vt*0.3
-    ra = {'Bull':1.0, 'Sideways':0.9, 'Bear':0.8}.get(regime_name, 0.9)
+    vt = 1.0 if df['volume'].tail(20).mean() > df['volume'].tail(40).head(20).mean() * 1.05 else 0.5
+    raw = green_days * 0.4 + min(gl, 2.0) * 0.3 + vt * 0.3
+    ra = {'Bull': 1.0, 'Sideways': 0.9, 'Bear': 0.8}.get(regime_name, 0.9)
     a_mqs = raw * ra
 
     live_high = float(realtime.get('high') or 0)
@@ -2273,13 +2575,18 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
         current_price > ema20_cur and sme_ema20_rising and
         close_position >= SME_CLOSE_POSITION_MIN)
 
-    if core_catcher and strong_momentum and ignition: sme_catcher_level = 'STRONG'
-    elif core_catcher: sme_catcher_level = 'CORE'
-    else: sme_catcher_level = 'NONE'
+    if core_catcher and strong_momentum and ignition:
+        sme_catcher_level = 'STRONG'
+    elif core_catcher:
+        sme_catcher_level = 'CORE'
+    else:
+        sme_catcher_level = 'NONE'
 
     liquidity_mult = SME_LIQ_MIN
     for th, m in SME_LIQ_TIERS:
-        if l_score >= th: liquidity_mult = m; break
+        if l_score >= th:
+            liquidity_mult = m
+            break
 
     cap = 0.20 if sme_catcher_level == 'STRONG' else 0.12 if sme_catcher_level == 'CORE' else 0.0
     position_size_pct = round(cap * liquidity_mult * 100, 1)
@@ -2316,7 +2623,8 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     enhancers = 0
     if any(p.get('tier') == 1 and p.get('direction') == 'bullish' for p in candle_patterns): enhancers += 1
     if len(df) >= 30:
-        rr_ = df.tail(30); ranges = rr_['high'] - rr_['low']
+        rr_ = df.tail(30)
+        ranges = rr_['high'] - rr_['low']
         if len(ranges) >= 10:
             if ranges.iloc[-5:].mean() < 0.8 * ranges.iloc[-10:-5].mean(): enhancers += 1
     if avg_vol_50 > 0 and projected_vol > 1.5 * avg_vol_50: enhancers += 1
@@ -2351,28 +2659,28 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
         symbol=symbol, current_price=current_price, market_cap=market_cap,
         sector=realtime.get('sector', ''), df=df, realtime_data=realtime,
         rsi_value=rsi, adx_value=adx, atr_value=atr, macd_status=macd_status,
-        final_stop=final_stop, price_targets={'target1': target1, 'target2': target1*1.5},
+        final_stop=final_stop, price_targets={'target1': target1, 'target2': target1 * 1.5},
         reward_risk_ratio=rr_prelim, reward_risk_final=0.0,
         avg_daily_volume_50=avg_vol_50,
         last_day_volume=int(live_vol), volume_pct_of_avg=volume_pct_of_avg,
         liquidity_pass=liquidity_pass, weekly_aligned=weekly_aligned, a_mqs=a_mqs,
-        enhancer_count=enhancers, enhancer_pct=min(1.0, enhancers/9.0),
+        enhancer_count=enhancers, enhancer_pct=min(1.0, enhancers / 9.0),
         core_filters_pass=core_pass, swing_setup_type=phase['event'],
         market_phase=phase['phase'], signal_type=decision['signal'],
         primary_candle_pattern=primary_name if primary_name else " ",
         all_candle_patterns=candle_patterns, radar_score=radar_score,
         radar_flags=radar_flags, last_turnover=last_turnover,
-        sme_catcher_level=sme_catcher_level, sme_l_score=round(l_score,3),
-        sme_volume_ratio=round(sme_volume_ratio,3),
-        sme_price_vs_ema20=round(price_vs_ema20,3),
+        sme_catcher_level=sme_catcher_level, sme_l_score=round(l_score, 3),
+        sme_volume_ratio=round(sme_volume_ratio, 3),
+        sme_price_vs_ema20=round(price_vs_ema20, 3),
         sme_ema20_rising=sme_ema20_rising,
-        sme_close_position=round(close_position,3),
+        sme_close_position=round(close_position, 3),
         sme_relative_strength=rel_strength,
         sme_entry_type=sme_entry_type, sme_position_size_pct=position_size_pct,
-        sme_liquidity_multiplier=round(liquidity_mult,2),
+        sme_liquidity_multiplier=round(liquidity_mult, 2),
         sme_market_cap_missing=bool(market_cap_missing),
         sme_emergency_floor_ok=emergency_floor_ok,
-        sme_adtv_20=round(adtv_20,0), sme_free_float_est=round(free_float_est,0),
+        sme_adtv_20=round(adtv_20, 0), sme_free_float_est=round(free_float_est, 0),
         sme_data_health=sme_data_health, sme_ignition=ignition,
         momentum_score=momentum_score,
         extension_pct_from_sma20=round(extension_pct, 3),
@@ -2382,16 +2690,16 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
         hike_tier=hike_tier, hike_tier_entry_allowed=hike_entry_allowed,
         asset_class=_classify_asset(symbol))
 
-    setup_map = {'High-2':10,'Low-2':10,'Reverse Divergence':9,'2B Reversal':8,'VCP':8,
-                 'Pattern Failure':7,'Support Reversal':6,'Resistance Reversal':6,
-                 'Spring':10,'BOS (Up)':9,'BOS (Down)':1,'UTAD':2,'None':3}
+    setup_map = {'High-2': 10, 'Low-2': 10, 'Reverse Divergence': 9, '2B Reversal': 8, 'VCP': 8,
+                 'Pattern Failure': 7, 'Support Reversal': 6, 'Resistance Reversal': 6,
+                 'Spring': 10, 'BOS (Up)': 9, 'BOS (Down)': 1, 'UTAD': 2, 'None': 3}
     setup_score = setup_map.get(phase['event'], 3)
     tech = 10 if adx > 40 else 8 if adx >= 25 else 5 if adx >= 20 else 3
     vol_ = 10 if report.volume_pct_of_avg > 2.0 else 8 if report.volume_pct_of_avg > 1.5 else 7 if report.volume_pct_of_avg < 0.7 else 4
     fund = 7 if (realtime.get('pe_ratio') is not None and realtime.get('pe_ratio', 99) < 20) else 5
     gate = 1.0 if core_pass else 0.0
-    report.cprs = 0.25*a_mqs + 0.20*setup_score/10 + 0.15*tech/10 + 0.10*vol_/10 + 0.10*gate + 0.10*fund/10
-    confidence = (a_mqs*100*0.4) + (report.cprs*100*0.3) + ((enhancers/9)*100*0.3)
+    report.cprs = 0.25 * a_mqs + 0.20 * setup_score / 10 + 0.15 * tech / 10 + 0.10 * vol_ / 10 + 0.10 * gate + 0.10 * fund / 10
+    confidence = (a_mqs * 100 * 0.4) + (report.cprs * 100 * 0.3) + ((enhancers / 9) * 100 * 0.3)
     confidence = min(100, max(0, confidence))
 
     a_pass = (current_price > df['close'].rolling(20).mean().iloc[-1] and rsi > 55 and
@@ -2400,39 +2708,49 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
               and realtime.get('pe_ratio') is not None and realtime.get('pe_ratio', 99) < 20)
 
     def rpd(tgt, stp, days):
-        g = tgt - current_price; l = current_price - stp
+        g = tgt - current_price
+        l = current_price - stp
         if g <= 0 or l <= 0 or days <= 0: return 0.0
-        return (((confidence/100)*g) - ((1-confidence/100)*l)) / days
-    rpd_a = rpd(current_price + 2*atr, current_price - 1*atr, AB_VARIANT_A_MAX_DAYS) if a_pass else 0.0
-    rpd_b = rpd(current_price + 3*atr, current_price - 1.5*atr, AB_VARIANT_B_MAX_DAYS) if b_pass else 0.0
-    if rpd_a > 0 and rpd_b == 0: report.ab_variant = 'A'
-    elif rpd_b > 0 and rpd_a == 0: report.ab_variant = 'B'
-    elif rpd_a > rpd_b * 1.1: report.ab_variant = 'A'
-    elif rpd_b > rpd_a * 1.1: report.ab_variant = 'B'
-    elif rpd_a > 0 and rpd_b > 0: report.ab_variant = 'SPLIT'
-    else: report.ab_variant = 'NONE'
-    report.ab_rpd_a = round(rpd_a,4); report.ab_rpd_b = round(rpd_b,4)
+        return (((confidence / 100) * g) - ((1 - confidence / 100) * l)) / days
+
+    rpd_a = rpd(current_price + 2 * atr, current_price - 1 * atr, AB_VARIANT_A_MAX_DAYS) if a_pass else 0.0
+    rpd_b = rpd(current_price + 3 * atr, current_price - 1.5 * atr, AB_VARIANT_B_MAX_DAYS) if b_pass else 0.0
+    if rpd_a > 0 and rpd_b == 0:
+        report.ab_variant = 'A'
+    elif rpd_b > 0 and rpd_a == 0:
+        report.ab_variant = 'B'
+    elif rpd_a > rpd_b * 1.1:
+        report.ab_variant = 'A'
+    elif rpd_b > rpd_a * 1.1:
+        report.ab_variant = 'B'
+    elif rpd_a > 0 and rpd_b > 0:
+        report.ab_variant = 'SPLIT'
+    else:
+        report.ab_variant = 'NONE'
+    report.ab_rpd_a = round(rpd_a, 4)
+    report.ab_rpd_b = round(rpd_b, 4)
     report.ab_selected_variant = report.ab_variant
-    report.ab_confidence_score = round(confidence,1)
+    report.ab_confidence_score = round(confidence, 1)
     if report.ab_variant == 'A':
         report.ab_entry_price = current_price
-        report.ab_stop_loss = current_price - AB_VARIANT_A_SL_ATR*atr
-        report.ab_take_profit = current_price + AB_VARIANT_A_TP_ATR*atr
+        report.ab_stop_loss = current_price - AB_VARIANT_A_SL_ATR * atr
+        report.ab_take_profit = current_price + AB_VARIANT_A_TP_ATR * atr
         report.ab_max_holding_days = AB_VARIANT_A_MAX_DAYS if ab_mode == 'LONG' else AB_SHORT_MODE_DAYS
     elif report.ab_variant == 'B':
         report.ab_entry_price = current_price
-        report.ab_stop_loss = current_price - AB_VARIANT_B_SL_ATR*atr
-        report.ab_take_profit = current_price + AB_VARIANT_B_TP_ATR*atr
+        report.ab_stop_loss = current_price - AB_VARIANT_B_SL_ATR * atr
+        report.ab_take_profit = current_price + AB_VARIANT_B_TP_ATR * atr
         report.ab_max_holding_days = AB_VARIANT_B_MAX_DAYS if ab_mode == 'LONG' else AB_SHORT_MODE_DAYS
     else:
         report.ab_entry_price = current_price
         report.ab_stop_loss = current_price - atr
-        report.ab_take_profit = current_price + 2*atr
+        report.ab_take_profit = current_price + 2 * atr
         report.ab_max_holding_days = AB_VARIANT_A_MAX_DAYS
     rps = report.ab_entry_price - report.ab_stop_loss
     if rps > 0:
         ml = account_equity * AB_MAX_RISK_PCT
-        report.ab_max_loss = round(ml,2); report.ab_risk_per_share = round(rps,2)
+        report.ab_max_loss = round(ml, 2)
+        report.ab_risk_per_share = round(rps, 2)
         report.ab_position_size = int(ml / rps)
 
     if hike_tier == TIER_LATE and report.ab_position_size > 0:
@@ -2440,10 +2758,14 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     report.ab_expected_rpd = max(rpd_a, rpd_b)
 
     mcmc = compute_mcmc(symbol, df, current_price, dsex_series)
-    report.buy_zone = mcmc['buy_zone']; report.target_zone = mcmc['target']; report.var_stop = mcmc['stop']
-    report.mcmc_signal = mcmc['signal']; report.mcmc_mu = mcmc['mu_hat']
+    report.buy_zone = mcmc['buy_zone']
+    report.target_zone = mcmc['target']
+    report.var_stop = mcmc['stop']
+    report.mcmc_signal = mcmc['signal']
+    report.mcmc_mu = mcmc['mu_hat']
     report.mcmc_mu_raw = mcmc.get('mu_hat_raw', 0.0)
-    report.mcmc_sigma = mcmc['sigma_adapt']; report.mcmc_t_stat = mcmc['t_stat']
+    report.mcmc_sigma = mcmc['sigma_adapt']
+    report.mcmc_t_stat = mcmc['t_stat']
     report.bayesian_pass = bool(current_price <= mcmc['buy_zone'] * 1.03)
     report.bayesian_deep = bool(current_price <= mcmc['buy_zone'])
     report.breadth_theta = breadth_theta
@@ -2463,8 +2785,8 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     elif (not below_ma20) and (not bearish_candle) and rsi >= 45:
         canvas, cr = 'HOLD', 'Above MA20, healthy RSI'
     elif ((bearish_candle and below_ma20)
-            or (below_ma20 and weak_rsi and strong_bear_trend)
-            or (below_ma20 and mcmc['signal'] == 'SELL' and adx > 22)):
+          or (below_ma20 and weak_rsi and strong_bear_trend)
+          or (below_ma20 and mcmc['signal'] == 'SELL' and adx > 22)):
         canvas, cr = 'SELL', 'Below MA20 with confirmation'
     else:
         canvas, cr = 'WAIT', 'No decisive signal'
@@ -2478,7 +2800,8 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     report.canvas_reason = cr
 
     bc = evaluate_buy_conditions(report, dsex_series, regime_name, vol_label)
-    report.buy_conditions = bc; report.verdict = bc['Verdict']
+    report.buy_conditions = bc
+    report.verdict = bc['Verdict']
     report.weinstein_stage2 = bool(bc['Weinstein_Stage2'])
 
     forecast = compute_forecast_1w(
@@ -2488,11 +2811,16 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
         weinstein_stage2='YES' if bc['Weinstein_Stage2'] else 'NO',
         regime=regime_name, avg_turnover=mcmc['avg_turnover'], a_mqs=a_mqs,
         use_simplified=(abs(mcmc['t_stat']) < 1.8))
-    report.fc_mu_shrunk = forecast['mu_shrunk']; report.fc_r_mid = forecast['r_mid_effective']
-    report.fc_sigma_1w = forecast['sigma_1w']; report.fc_P_low = forecast['P_low']
-    report.fc_P_mid = forecast['P_mid']; report.fc_P_high = forecast['P_high']
-    report.fc_band_pct = forecast['band_width_pct']; report.fc_version = forecast['version']
-    report.forecast_signal = forecast['signal']; report.forecast_reason = forecast['reason']
+    report.fc_mu_shrunk = forecast['mu_shrunk']
+    report.fc_r_mid = forecast['r_mid_effective']
+    report.fc_sigma_1w = forecast['sigma_1w']
+    report.fc_P_low = forecast['P_low']
+    report.fc_P_mid = forecast['P_mid']
+    report.fc_P_high = forecast['P_high']
+    report.fc_band_pct = forecast['band_width_pct']
+    report.fc_version = forecast['version']
+    report.forecast_signal = forecast['signal']
+    report.forecast_reason = forecast['reason']
     report.projection_1w = current_price * np.exp(forecast['mu_shrunk'] * TRADING_DAYS_1W)
 
     reward = max(forecast['P_high'] - current_price, 0.0)
@@ -2509,10 +2837,14 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
         adtv20=adtv_20, extension_pct=extension_pct,
         vol_div_days=vol_div_max, hike_tier=hike_tier)
 
-    report.fuzzy_v3_M = fz['M']; report.fuzzy_v3_P = fz['P']
-    report.fuzzy_v3_C = fz['C']; report.fuzzy_v3_C_raw = fz.get('C_raw', 0.0)
-    report.fuzzy_v3_R = fz['R']; report.fuzzy_v3_L = fz['L']
-    report.fuzzy_v3_S_gate = fz['S_gate']; report.fuzzy_v3_S_rank = fz['S_rank']
+    report.fuzzy_v3_M = fz['M']
+    report.fuzzy_v3_P = fz['P']
+    report.fuzzy_v3_C = fz['C']
+    report.fuzzy_v3_C_raw = fz.get('C_raw', 0.0)
+    report.fuzzy_v3_R = fz['R']
+    report.fuzzy_v3_L = fz['L']
+    report.fuzzy_v3_S_gate = fz['S_gate']
+    report.fuzzy_v3_S_rank = fz['S_rank']
     report.fuzzy_v3_turnover_velocity = fz['turnover_velocity']
     report.fuzzy_v3_Reasons = safe_json_dumps(fz['Reasons'], ensure_ascii=False)
     report.fuzzy_v3_hard_gate_pass = fz['hard_gate_pass']
@@ -2521,15 +2853,25 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
     report.fuzzy_v3_th_mild = fz['th_mild']
     report.fuzzy_v3_th_watch = fz['th_watch']
 
-    report.fuzzy_S = fz['S_rank']; report.fuzzy_C = fz['C']; report.fuzzy_R = fz['R']
+    report.fuzzy_S = fz['S_rank']
+    report.fuzzy_C = fz['C']
+    report.fuzzy_R = fz['R']
     report.fuzzy_FinalScore = fz['S_rank']
-    report.fuzzy_Action = fz['Action']; report.fuzzy_ActionBn = fz['ActionBn']
-    report.fuzzy_Size = fz['Size']; report.fuzzy_Color = fz['Color']
-    report.fuzzy_t = mcmc['t_stat']; report.fuzzy_N = mcmc['n_eff']
-    report.fuzzy_P_mu = mcmc.get('P_mu', 0.5); report.fuzzy_P_mu_sigma = 0.5
-    report.fuzzy_B = breadth_theta; report.fuzzy_C_raw = fz.get('C_raw', 0.0)
-    report.fuzzy_C_penalty = 1.0; report.fuzzy_P_sigma = 0.5; report.fuzzy_P_DD = 0.5
-    report.fuzzy_R_raw = fz['R']; report.fuzzy_RegimeDamp = 1.0
+    report.fuzzy_Action = fz['Action']
+    report.fuzzy_ActionBn = fz['ActionBn']
+    report.fuzzy_Size = fz['Size']
+    report.fuzzy_Color = fz['Color']
+    report.fuzzy_t = mcmc['t_stat']
+    report.fuzzy_N = mcmc['n_eff']
+    report.fuzzy_P_mu = mcmc.get('P_mu', 0.5)
+    report.fuzzy_P_mu_sigma = 0.5
+    report.fuzzy_B = breadth_theta
+    report.fuzzy_C_raw = fz.get('C_raw', 0.0)
+    report.fuzzy_C_penalty = 1.0
+    report.fuzzy_P_sigma = 0.5
+    report.fuzzy_P_DD = 0.5
+    report.fuzzy_R_raw = fz['R']
+    report.fuzzy_RegimeDamp = 1.0
 
     if hike_tier == TIER_LATE and report.sme_position_size_pct > 0:
         report.sme_position_size_pct = round(report.sme_position_size_pct * LATE_POSITION_MULT, 1)
@@ -2559,11 +2901,12 @@ def analyze_stock_canvas(symbol, dsex_series=None, breadth_theta=0.0, regime_fac
 
 # ==================== BUY CONDITIONS ====================
 def get_dynamic_thresholds(regime, vol_label):
-    if regime == 'Bull' and vol_label == 'Low': return {'mqs_min':0.45,'rsi_min':50,'adx_min':20,'vol_min':1.0,'pos_size':1.25}
-    if regime == 'Bull' and vol_label == 'High': return {'mqs_min':0.50,'rsi_min':52,'adx_min':25,'vol_min':1.2,'pos_size':1.0}
-    if regime == 'Sideways' and vol_label == 'Low': return {'mqs_min':0.55,'rsi_min':55,'adx_min':25,'vol_min':1.5,'pos_size':0.75}
-    if regime == 'Sideways' and vol_label == 'High': return {'mqs_min':0.60,'rsi_min':58,'adx_min':30,'vol_min':2.0,'pos_size':0.50}
-    return {'mqs_min':0.65,'rsi_min':60,'adx_min':30,'vol_min':2.0,'pos_size':0.25}
+    if regime == 'Bull' and vol_label == 'Low': return {'mqs_min': 0.45, 'rsi_min': 50, 'adx_min': 20, 'vol_min': 1.0, 'pos_size': 1.25}
+    if regime == 'Bull' and vol_label == 'High': return {'mqs_min': 0.50, 'rsi_min': 52, 'adx_min': 25, 'vol_min': 1.2, 'pos_size': 1.0}
+    if regime == 'Sideways' and vol_label == 'Low': return {'mqs_min': 0.55, 'rsi_min': 55, 'adx_min': 25, 'vol_min': 1.5, 'pos_size': 0.75}
+    if regime == 'Sideways' and vol_label == 'High': return {'mqs_min': 0.60, 'rsi_min': 58, 'adx_min': 30, 'vol_min': 2.0, 'pos_size': 0.50}
+    return {'mqs_min': 0.65, 'rsi_min': 60, 'adx_min': 30, 'vol_min': 2.0, 'pos_size': 0.25}
+
 
 def evaluate_buy_conditions(report, dsex_series, regime, vol_label):
     th = get_dynamic_thresholds(regime, vol_label)
@@ -2587,22 +2930,22 @@ def evaluate_buy_conditions(report, dsex_series, regime, vol_label):
     r7 = bool(report.volume_pct_of_avg >= th['vol_min'])
     rrm = 2.0 if regime == 'Bull' else 2.5 if regime == 'Sideways' else 3.0
     r8 = bool(report.reward_risk_ratio >= rrm)
-    rules = [r1,r2,r3,r4,r5,r6,r7,r8]
+    rules = [r1, r2, r3, r4, r5, r6, r7, r8]
     tp = int(sum(rules))
 
     pg = (report.df['close'].diff() > 0).tail(90).mean() * 100 if len(report.df) >= 90 else 50
     cg = 0
-    for i in range(len(report.df)-1, -1, -1):
-        if i > 0 and report.df['close'].iloc[i] > report.df['close'].iloc[i-1]: cg += 1
+    for i in range(len(report.df) - 1, -1, -1):
+        if i > 0 and report.df['close'].iloc[i] > report.df['close'].iloc[i - 1]: cg += 1
         else: break
-    fip = (pg/10) + min(cg,10)
+    fip = (pg / 10) + min(cg, 10)
     fm = 8 if regime == 'Bull' else 12 if regime == 'Sideways' else 15
     fp = bool(fip >= fm)
 
     bm = 0
     obv = (np.sign(report.df['close'].diff()).fillna(0) * report.df['volume']).cumsum()
     if len(obv) > 20 and obv.tail(10).mean() > obv.tail(20).mean(): bm += 2
-    if report.avg_daily_volume_50 > 0 and report.last_day_volume > 1.2*report.avg_daily_volume_50: bm += 1
+    if report.avg_daily_volume_50 > 0 and report.last_day_volume > 1.2 * report.avg_daily_volume_50: bm += 1
     if report.adx_value >= th['adx_min']: bm += 1
     if report.rsi_value >= th['rsi_min']: bm += 1
     if report.current_price > report.df['close'].rolling(20).mean().iloc[-1]: bm += 1
@@ -2617,34 +2960,39 @@ def evaluate_buy_conditions(report, dsex_series, regime, vol_label):
     s2 = bool(not np.isnan(ma200) and report.current_price > ma200 and
               not np.isnan(ma50n) and not np.isnan(ma50p) and ma50n > ma50p)
 
-    if tp >= 7 and fp and bmp and s2: v = 'GREEN'
-    elif tp >= 5 and (fp or bmp): v = 'YELLOW'
-    else: v = 'RED'
-    return {'Rule1':r1,'Rule2':r2,'Rule3':r3,'Rule4':r4,'Rule5':r5,'Rule6':r6,'Rule7':r7,'Rule8':r8,
-            'TotalPass':tp,'FIP_Score':round(float(fip),1),'FIP_Pass':fp,
-            'BigMoney_Score':int(bm),'BigMoney_Pass':bmp,
-            'Weinstein_Stage2':s2,'Verdict':v}
+    if tp >= 7 and fp and bmp and s2:
+        v = 'GREEN'
+    elif tp >= 5 and (fp or bmp):
+        v = 'YELLOW'
+    else:
+        v = 'RED'
+    return {'Rule1': r1, 'Rule2': r2, 'Rule3': r3, 'Rule4': r4, 'Rule5': r5, 'Rule6': r6, 'Rule7': r7, 'Rule8': r8,
+            'TotalPass': tp, 'FIP_Score': round(float(fip), 1), 'FIP_Pass': fp,
+            'BigMoney_Score': int(bm), 'BigMoney_Pass': bmp,
+            'Weinstein_Stage2': s2, 'Verdict': v}
 
 
 # ==================== BANGLA LABELS ====================
 def _bn_sig(sig):
-    return {'BUY':('🟢 এখন কেনার জন্য ভালো সময়','buy'),
-            'HOLD':('🟡 হাতে ধরে রাখুন','hold'),
-            'WAIT':('⏳ এখন অপেক্ষা করুন','wait'),
-            'SELL':('🔴 বিক্রি করার কথা ভাবুন','sell')}.get(sig, ('❔ স্পষ্ট সংকেত নেই','wait'))
+    return {'BUY': ('🟢 এখন কেনার জন্য ভালো সময়', 'buy'),
+            'HOLD': ('🟡 হাতে ধরে রাখুন', 'hold'),
+            'WAIT': ('⏳ এখন অপেক্ষা করুন', 'wait'),
+            'SELL': ('🔴 বিক্রি করার কথা ভাবুন', 'sell')}.get(sig, ('❔ স্পষ্ট সংকেত নেই', 'wait'))
+
 
 def _bn_radar(f):
-    m = {'BB_SQUEEZE':'দামের ওঠানামা ছোট — বড় নড়াচড়ার প্রস্তুতি',
-         'VOL_DRYUP':'লেনদেন শান্ত — বড় ক্রেতাদের আগমনী সময়',
-         'NEAR_HIGH':'সাম্প্রতিক উঁচু দামের কাছাকাছি',
-         'RSI_ZONE':'দাম সঠিক গতিতে এগোচ্ছে',
-         'ADX_RISING':'ঊর্ধ্বমুখী প্রবণতা শক্তিশালী হচ্ছে',
-         'MACD_TURN':'দাম উপরের দিকে ঘুরে দাঁড়াচ্ছে',
-         'OBV_RISING':'বড় ক্রেতারা ধীরে ধীরে কিনছে',
-         'ABOVE_MA20':'গড় দামের উপরে অবস্থান',
-         'VOL_IGNITION':'🔥 হঠাৎ লেনদেন অনেক বেড়েছে',
-         'LIQ_OK':'পর্যাপ্ত কেনাবেচা হচ্ছে'}
+    m = {'BB_SQUEEZE': 'দামের ওঠানামা ছোট — বড় নড়াচড়ার প্রস্তুতি',
+         'VOL_DRYUP': 'লেনদেন শান্ত — বড় ক্রেতাদের আগমনী সময়',
+         'NEAR_HIGH': 'সাম্প্রতিক উঁচু দামের কাছাকাছি',
+         'RSI_ZONE': 'দাম সঠিক গতিতে এগোচ্ছে',
+         'ADX_RISING': 'ঊর্ধ্বমুখী প্রবণতা শক্তিশালী হচ্ছে',
+         'MACD_TURN': 'দাম উপরের দিকে ঘুরে দাঁড়াচ্ছে',
+         'OBV_RISING': 'বড় ক্রেতারা ধীরে ধীরে কিনছে',
+         'ABOVE_MA20': 'গড় দামের উপরে অবস্থান',
+         'VOL_IGNITION': '🔥 হঠাৎ লেনদেন অনেক বেড়েছে',
+         'LIQ_OK': 'পর্যাপ্ত কেনাবেচা হচ্ছে'}
     return m.get(f, f)
+
 
 def _bn_rsi(r):
     r = float(r)
@@ -2654,18 +3002,22 @@ def _bn_rsi(r):
     if r >= 30: return 'দুর্বল — বিক্রির চাপ আছে'
     return 'খুব ঠান্ডা — হয়তো ঘুরে দাঁড়ানোর সময়'
 
+
 def _bn_verdict(v):
-    return {'GREEN':'সমস্ত শর্ত পূরণ','YELLOW':'বেশিরভাগ শর্ত পূরণ','RED':'এখনো স্পষ্ট সমর্থন নেই'}.get(v, v)
+    return {'GREEN': 'সমস্ত শর্ত পূরণ', 'YELLOW': 'বেশিরভাগ শর্ত পূরণ', 'RED': 'এখনো স্পষ্ট সমর্থন নেই'}.get(v, v)
+
 
 def _bn_trend(r):
     try:
         c20 = float(r.df['close'].rolling(20).mean().iloc[-1])
         c50 = float(r.df['close'].rolling(50).mean().iloc[-1])
-    except Exception: return 'নির্ধারণ করা যায়নি'
+    except Exception:
+        return 'নির্ধারণ করা যায়নি'
     p = r.current_price
     if p > c20 > c50: return 'দাম উপরের দিকে — ক্রেতা শক্তিশালী'
     if p < c20 < c50: return 'দাম নিচের দিকে — বিক্রেতা শক্তিশালী'
     return 'দাম পাশাপাশি চলছে'
+
 
 def _bn_reasons(r):
     rs = []
@@ -2688,6 +3040,7 @@ def _bn_reasons(r):
     if not rs: rs.append('সাধারণ অবস্থা')
     return rs
 
+
 def report_to_bangla_dict(r, dts):
     rt, rc = _bn_sig(r.canvas_signal)
     price = float(r.current_price)
@@ -2704,19 +3057,19 @@ def report_to_bangla_dict(r, dts):
     except Exception:
         v3_reasons = []
     tier_label, tier_cls = TIER_BN.get(getattr(r, 'hike_tier', TIER_NONE), ('', ''))
-    return {'symbol':str(r.symbol),'price':safe_float(price,2),'proj':safe_float(proj,2),
-            'projDiff':safe_float(pd_,1),'projArrow':str(arrow),'recText':str(rt),'recClass':str(rc),
-            'trend':str(_bn_trend(r)),'rsiText':str(_bn_rsi(r.rsi_value)),
-            'verdictText':str(_bn_verdict(r.verdict)),'reasons':list(reasons),'flags':list(fl),
-            'buyZone':safe_float(r.buy_zone or price,2),'target':safe_float(r.target_zone or price*1.05,2),
-            'stop':safe_float(r.var_stop or price*0.95,2),'radarScore':safe_int(r.radar_score),
-            'canvasSignal':str(r.canvas_signal),'canvasReason':str(r.canvas_reason),
-            'hasIgnition':bool('VOL_IGNITION' in (r.radar_flags or '')),
-            'verdict':str(r.verdict),'fuzzyAction':str(r.fuzzy_ActionBn),
-            'fuzzyActionEn':str(r.fuzzy_Action),'fuzzyFinal':safe_float(r.fuzzy_FinalScore,3),
-            'fuzzyColor':str(r.fuzzy_Color),'fuzzySize':str(r.fuzzy_Size),
-            'dataHealth':str(r.sme_data_health),'smeIgnition':bool(r.sme_ignition),
-            'fuzzyV3Reasons':v3_reasons,
+    return {'symbol': str(r.symbol), 'price': safe_float(price, 2), 'proj': safe_float(proj, 2),
+            'projDiff': safe_float(pd_, 1), 'projArrow': str(arrow), 'recText': str(rt), 'recClass': str(rc),
+            'trend': str(_bn_trend(r)), 'rsiText': str(_bn_rsi(r.rsi_value)),
+            'verdictText': str(_bn_verdict(r.verdict)), 'reasons': list(reasons), 'flags': list(fl),
+            'buyZone': safe_float(r.buy_zone or price, 2), 'target': safe_float(r.target_zone or price * 1.05, 2),
+            'stop': safe_float(r.var_stop or price * 0.95, 2), 'radarScore': safe_int(r.radar_score),
+            'canvasSignal': str(r.canvas_signal), 'canvasReason': str(r.canvas_reason),
+            'hasIgnition': bool('VOL_IGNITION' in (r.radar_flags or '')),
+            'verdict': str(r.verdict), 'fuzzyAction': str(r.fuzzy_ActionBn),
+            'fuzzyActionEn': str(r.fuzzy_Action), 'fuzzyFinal': safe_float(r.fuzzy_FinalScore, 3),
+            'fuzzyColor': str(r.fuzzy_Color), 'fuzzySize': str(r.fuzzy_Size),
+            'dataHealth': str(r.sme_data_health), 'smeIgnition': bool(r.sme_ignition),
+            'fuzzyV3Reasons': v3_reasons,
             'finalScore': safe_float(r.final_score, 4),
             'finalSignal': str(r.final_signal),
             'assetClass': str(r.asset_class),
@@ -2741,22 +3094,26 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
         dts = timestamp
 
     def ab_vn(v):
-        return {'A':('মোমেন্টাম কৌশল','a'),'B':('ভ্যালু কৌশল','b'),
-                'SPLIT':('৫০/৫০','split')}.get(v, ('কোনো কৌশল নেই','none'))
+        return {'A': ('মোমেন্টাম কৌশল', 'a'), 'B': ('ভ্যালু কৌশল', 'b'),
+                'SPLIT': ('৫০/৫০', 'split')}.get(v, ('কোনো কৌশল নেই', 'none'))
+
     def ab_an(v, a, b):
         if v == 'A': return f'মোমেন্টাম কৌশল বেছে নিন (RPD: {a:.4f})'
         if v == 'B': return f'ভ্যালু কৌশল বেছে নিন (RPD: {b:.4f})'
         if v == 'SPLIT': return 'দুই কৌশলেই অর্ধেক বিনিয়োগ'
         return 'এখন কোনো ট্রেড নেবেন না'
+
     def fz_bn(a):
-        return {'Strong Buy':('🟢🟢 দৃঢ় ক্রয়','buy-strong'),
-                'Mild Buy':('🟢 মৃদু ক্রয়','buy-mild'),
-                'Neutral / Watch':('⏳ নিরপেক্ষ / অপেক্ষা','neutral'),
-                'Avoid':('🔴 এড়িয়ে যান','sell-strong')}.get(a, ('❔ অজানা','neutral'))
+        return {'Strong Buy': ('🟢🟢 দৃঢ় ক্রয়', 'buy-strong'),
+                'Mild Buy': ('🟢 মৃদু ক্রয়', 'buy-mild'),
+                'Neutral / Watch': ('⏳ নিরপেক্ষ / অপেক্ষা', 'neutral'),
+                'Avoid': ('🔴 এড়িয়ে যান', 'sell-strong')}.get(a, ('❔ অজানা', 'neutral'))
+
     def fz_sz(a):
-        return {'Strong Buy':'সর্বোচ্চ মূলধন (৮-১০%)','Mild Buy':'অর্ধেক (৪-৫%)',
-                'Neutral / Watch':'নগদ / কোনো ট্রেড নয় (০%)',
-                'Avoid':'নগদ / কোনো ট্রেড নয় (০%)'}.get(a, 'স্পষ্ট নয়')
+        return {'Strong Buy': 'সর্বোচ্চ মূলধন (৮-১০%)', 'Mild Buy': 'অর্ধেক (৪-৫%)',
+                'Neutral / Watch': 'নগদ / কোনো ট্রেড নয় (০%)',
+                'Avoid': 'নগদ / কোনো ট্রেড নয় (০%)'}.get(a, 'স্পষ্ট নয়')
+
     def fz_rs(r):
         rs = []
         if r.fuzzy_v3_M >= 0.6: rs.append('📈 শক্তিশালী মোমেন্টাম')
@@ -2776,33 +3133,44 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
         elif getattr(r, 'hike_tier', TIER_NONE) == TIER_LATE:
             rs.append(f'🟠 LATE_HIKE — ext={r.extension_pct_from_sma20:.1f}% (সাইজ ক্যাপ)')
         return rs
+
     def sme_c(l):
-        return {'STRONG':('🔥 শক্তিশালী সন্ধান','strong'),
-                'CORE':('✅ মূল সন্ধান','core'),
-                'NONE':('⏭️ এড়িয়ে যান','none')}.get(l, ('❔ অজানা','none'))
+        return {'STRONG': ('🔥 শক্তিশালী সন্ধান', 'strong'),
+                'CORE': ('✅ মূল সন্ধান', 'core'),
+                'NONE': ('⏭️ এড়িয়ে যান', 'none')}.get(l, ('❔ অজানা', 'none'))
+
     def sme_e(e):
-        return {'Breakout':'🚀 ব্রেকআউট (ভাঙার মুহূর্ত)',
-                'Pullback':'📉 পুলব্যাক (পিছু হটা) - সবচেয়ে পছন্দের',
-                'Continuation':'➡️ কন্টিনিউয়েশন (চলমান)',
-                'None':'⏭️ প্রবেশ নেই'}.get(e, e)
+        return {'Breakout': '🚀 ব্রেকআউট (ভাঙার মুহূর্ত)',
+                'Pullback': '📉 পুলব্যাক (পিছু হটা) - সবচেয়ে পছন্দের',
+                'Continuation': '➡️ কন্টিনিউয়েশন (চলমান)',
+                'None': '⏭️ প্রবেশ নেই'}.get(e, e)
+
     def sme_v(v):
-        try: v = float(v)
-        except Exception: v = 0.0
+        try:
+            v = float(v)
+        except Exception:
+            v = 0.0
         if v >= 2.0: return '🔥🔥 খুব বেশি'
         if v >= 1.5: return '🔥 বেশি'
         if v >= 1.2: return '✅ স্বাভাবিকের চেয়ে বেশি'
         if v >= 0.8: return '➖ স্বাভাবিক'
         return '📉 কম'
+
     def sme_l(l):
-        try: l = float(l)
-        except Exception: l = 0.0
+        try:
+            l = float(l)
+        except Exception:
+            l = 0.0
         if l >= 0.7: return '🟢 চমৎকার'
         if l >= 0.5: return '🟡 ভালো'
         if l >= 0.3: return '🟠 গ্রহণযোগ্য'
         return '🔴 দুর্বল'
+
     def sme_p(pct, c):
-        try: pct = float(pct)
-        except Exception: pct = 0.0
+        try:
+            pct = float(pct)
+        except Exception:
+            pct = 0.0
         if c == 'NONE': return '⏭️ এড়িয়ে যান (০%)'
         if pct >= 12: return f'💰 বড় বিনিয়োগ ({pct:.0f}%)'
         if pct >= 5: return f'💰 মাঝারি বিনিয়োগ ({pct:.0f}%)'
@@ -2829,8 +3197,10 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
         proj = float(r.projection_1w or price)
         pd_ = ((proj - price) / price * 100.0) if price > 0 else 0.0
         arrow = '▲' if pd_ > 0.3 else '▼' if pd_ < -0.3 else '▬'
-        try: ls = float(r.sme_l_score)
-        except Exception: ls = 0.0
+        try:
+            ls = float(r.sme_l_score)
+        except Exception:
+            ls = 0.0
         if r.sme_catcher_level == 'STRONG': sme_ps = 0.7 + ls * 0.3
         elif r.sme_catcher_level == 'CORE': sme_ps = 0.4 + ls * 0.3
         else: sme_ps = 0.0
@@ -2925,12 +3295,12 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
 
     sp_json = safe_json_dumps(sp_data, ensure_ascii=False)
     sp_total = len(sp_data)
-    sp_buy = sum(1 for d in sp_data if d['canvasSignal']=='BUY')
-    sp_hold = sum(1 for d in sp_data if d['canvasSignal']=='HOLD')
-    sp_wait = sum(1 for d in sp_data if d['canvasSignal']=='WAIT')
-    sp_sell = sum(1 for d in sp_data if d['canvasSignal']=='SELL')
-    sp_strong = sum(1 for d in sp_data if d['smeCatcherLevel']=='STRONG')
-    sp_core = sum(1 for d in sp_data if d['smeCatcherLevel']=='CORE')
+    sp_buy = sum(1 for d in sp_data if d['canvasSignal'] == 'BUY')
+    sp_hold = sum(1 for d in sp_data if d['canvasSignal'] == 'HOLD')
+    sp_wait = sum(1 for d in sp_data if d['canvasSignal'] == 'WAIT')
+    sp_sell = sum(1 for d in sp_data if d['canvasSignal'] == 'SELL')
+    sp_strong = sum(1 for d in sp_data if d['smeCatcherLevel'] == 'STRONG')
+    sp_core = sum(1 for d in sp_data if d['smeCatcherLevel'] == 'CORE')
 
     summary_data = [report_to_bangla_dict(r, dts) for r in reports]
     summary_json = safe_json_dumps(summary_data, ensure_ascii=False)
@@ -2982,10 +3352,10 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
         })
     ab_json = safe_json_dumps(ab_data, ensure_ascii=False)
     ab_total = len(ab_data)
-    ab_a = sum(1 for d in ab_data if d['variant']=='A')
-    ab_b = sum(1 for d in ab_data if d['variant']=='B')
-    ab_sp = sum(1 for d in ab_data if d['variant']=='SPLIT')
-    ab_no = sum(1 for d in ab_data if d['variant']=='NONE')
+    ab_a = sum(1 for d in ab_data if d['variant'] == 'A')
+    ab_b = sum(1 for d in ab_data if d['variant'] == 'B')
+    ab_sp = sum(1 for d in ab_data if d['variant'] == 'SPLIT')
+    ab_no = sum(1 for d in ab_data if d['variant'] == 'NONE')
     ab_tradeable = ab_a + ab_b + ab_sp
 
     fuzzy_data = []
@@ -3036,8 +3406,10 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
         vbn = sme_v(r.sme_volume_ratio)
         lbn = sme_l(r.sme_l_score)
         pbn = sme_p(r.sme_position_size_pct, r.sme_catcher_level)
-        try: ls = float(r.sme_l_score)
-        except Exception: ls = 0.0
+        try:
+            ls = float(r.sme_l_score)
+        except Exception:
+            ls = 0.0
         if r.sme_catcher_level == 'STRONG': ps = 0.7 + ls * 0.3
         elif r.sme_catcher_level == 'CORE': ps = 0.4 + ls * 0.3
         else: ps = 0.0
@@ -3066,13 +3438,13 @@ def generate_bangla_all_in_one_html(reports, timestamp, account_equity=1000000.0
         })
     sme_json = safe_json_dumps(sme_data, ensure_ascii=False)
     sme_total = len(sme_data)
-    sme_strong = sum(1 for d in sme_data if d['catcherLevel']=='STRONG')
-    sme_core = sum(1 for d in sme_data if d['catcherLevel']=='CORE')
-    sme_none = sum(1 for d in sme_data if d['catcherLevel']=='NONE')
+    sme_strong = sum(1 for d in sme_data if d['catcherLevel'] == 'STRONG')
+    sme_core = sum(1 for d in sme_data if d['catcherLevel'] == 'CORE')
+    sme_none = sum(1 for d in sme_data if d['catcherLevel'] == 'NONE')
     sme_mcap_missing = sum(1 for d in sme_data if d['marketCapMissing'])
-    sme_breakout = sum(1 for d in sme_data if d['entryType']=='Breakout')
-    sme_pullback = sum(1 for d in sme_data if d['entryType']=='Pullback')
-    sme_cont = sum(1 for d in sme_data if d['entryType']=='Continuation')
+    sme_breakout = sum(1 for d in sme_data if d['entryType'] == 'Breakout')
+    sme_pullback = sum(1 for d in sme_data if d['entryType'] == 'Pullback')
+    sme_cont = sum(1 for d in sme_data if d['entryType'] == 'Continuation')
 
     hike_data = []
     for r in reports:
@@ -3358,7 +3730,7 @@ body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#
 
     parts.append(f'''
   <div class="head">
-    <h1>📄 সব বাংলা রিপোর্ট (একীভূত – ৬টি ট্যাব) — v1.27 (Failure-Tracked)</h1>
+    <h1>📄 সব বাংলা রিপোর্ট (একীভূত – ৬টি ট্যাব) — v1.28 (DSE Archive Fallback)</h1>
     <div class="sub">রিপোর্ট সময়: <b>{dts}</b> &bull; অ্যাকাউন্ট: <b>{account_equity:,.0f}</b> টাকা</div>
     <div class="mode">📈 A/B মোড: {'স্বল্পমেয়াদী (১০ দিন)' if ab_mode == 'SHORT' else 'দীর্ঘমেয়াদী (২০ দিন)'}</div>
   </div>''')
@@ -3376,7 +3748,7 @@ body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#
     parts.append(f'''
   <div id="tab-swingparam" class="tab-content active">
     <div class="sum-head" style="background:linear-gradient(135deg,#fffbeb,#fef3c7);border-left:5px solid #f59e0b;">
-      <h2>🎯 Swing Parameter — একীভূত ভিউ (v1.27)</h2>
+      <h2>🎯 Swing Parameter — একীভূত ভিউ (v1.28)</h2>
       <div class="sub">মোট স্টক: <b>{sp_total}</b></div>
       <div class="counts">
         <div class="cnt buy"><div class="num">{sp_buy}</div><div class="lbl">🟢 BUY</div></div>
@@ -3427,7 +3799,7 @@ body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#
     parts.append(f'''
   <div id="tab-hike" class="tab-content">
     <div class="sum-head" style="background:linear-gradient(135deg,#fef2f2,#fee2e2);border-left:5px solid #dc2626;">
-      <h2>🥾 Hike-Tier Engine — v1.27</h2>
+      <h2>🥾 Hike-Tier Engine — v1.28</h2>
       <div class="sub">Extension = (close / SMA_20 − 1) × 100 &nbsp;|&nbsp; মোট: <b>{hike_total}</b></div>
       <div class="counts">
         <div class="cnt tier-none"><div class="num">{hike_counts.get(TIER_NONE,0)}</div><div class="lbl">⚪ NONE</div></div>
@@ -3486,7 +3858,7 @@ body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#
     parts.append(f'''
   <div id="tab-ab" class="tab-content">
     <div class="sum-head">
-      <h2>📊 Swing A/B Testing MCMC (v1.27, Risk 1.2%)</h2>
+      <h2>📊 Swing A/B Testing MCMC (v1.28, Risk 1.2%)</h2>
       <div class="counts">
         <div class="cnt stat-blue"><div class="num">{ab_total}</div><div class="lbl">মোট</div></div>
         <div class="cnt stat-blue"><div class="num">{ab_a}</div><div class="lbl">🅰️ মোমেন্টাম</div></div>
@@ -3511,7 +3883,7 @@ body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#
     parts.append(f'''
   <div id="tab-fuzzy" class="tab-content">
     <div class="sum-head">
-      <h2>🧠 ফাজি লজিক বাংলা রিপোর্ট — v1.27</h2>
+      <h2>🧠 ফাজি লজিক বাংলা রিপোর্ট — v1.28</h2>
       <div class="counts">
         <div class="cnt"><div class="num">{fz_total}</div><div class="lbl">মোট</div></div>
         <div class="cnt stat-green"><div class="num">{fz_sb}</div><div class="lbl">🟢🟢 দৃঢ় ক্রয়</div></div>
@@ -3537,7 +3909,7 @@ body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#
     parts.append(f'''
   <div id="tab-sme" class="tab-content">
     <div class="sum-head">
-      <h2>🚀 Swing Momentum Engine (v1.27)</h2>
+      <h2>🚀 Swing Momentum Engine (v1.28)</h2>
       <div class="counts">
         <div class="cnt"><div class="num">{sme_total}</div><div class="lbl">মোট</div></div>
         <div class="cnt sell"><div class="num">{sme_strong}</div><div class="lbl">🔥 শক্তিশালী</div></div>
@@ -3567,7 +3939,7 @@ body { font-family:'Noto Sans Bengali','Segoe UI',Arial,sans-serif; background:#
 
     parts.append(f'''
   <div class="foot">
-    DSE Canvas Scanner • ৬টি ট্যাব • v1.27 • {dts}<br>
+    DSE Canvas Scanner • ৬টি ট্যাব • v1.28 • {dts}<br>
     ⚠️ এই রিপোর্ট শুধুমাত্র তথ্যসূত্র। বিনিয়োগের আগে নিজে যাচাই করুন।
   </div>
 </div>
@@ -4159,7 +4531,7 @@ def _save_intermediate_csv(reports, path):
 
 def _print_clean_summary(reports, failed, total, failures_csv_path=None):
     """
-    v1.27: `failed` is now a list of dicts {symbol, reason, details}.
+    v1.28: `failed` is a list of dicts {symbol, reason, details}.
     """
     print("\n" + "=" * 60)
     print("📊 FULL SCAN SUMMARY")
@@ -4200,7 +4572,6 @@ def _print_clean_summary(reports, failed, total, failures_csv_path=None):
         print(f"  {i}. {r.symbol:12s}  Score: {r.final_score:.3f}  Signal: {r.final_signal}")
     print()
 
-    # ---------------- v1.27: FAILURE BREAKDOWN ----------------
     if failed:
         print("=" * 60)
         print("⚠️  FAILURE BREAKDOWN")
@@ -4225,9 +4596,38 @@ def _print_clean_summary(reports, failed, total, failures_csv_path=None):
     print("=" * 60)
 
 
+def _probe_history_sources():
+    """v1.28: quick probe at batch-scan startup — test both history routes."""
+    sym = "BATBC"
+    end = dt.date.today()
+    start = end - timedelta(days=60)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    print(f"🔎 Probing history sources for {sym} ({start_str} → {end_str}) …")
+    try:
+        df_bd = _HIST_COLLECTOR._from_bdshare(sym, start_str, end_str)
+        if df_bd is not None and len(df_bd) >= 20:
+            print(f"   ✅ bdshare           : {len(df_bd)} rows")
+        else:
+            print(f"   ⚠️  bdshare           : no rows (likely HTTP 410)")
+    except Exception as e:
+        print(f"   ❌ bdshare           : {type(e).__name__}: {str(e)[:60]}")
+
+    try:
+        df_dse = _HIST_COLLECTOR._from_dse_archive(sym, start_str, end_str)
+        if df_dse is not None and len(df_dse) >= 20:
+            print(f"   ✅ DSE archive       : {len(df_dse)} rows  ← fallback healthy")
+        else:
+            print(f"   ⚠️  DSE archive       : no rows")
+    except Exception as e:
+        print(f"   ❌ DSE archive       : {type(e).__name__}: {str(e)[:60]}")
+    print()
+
+
 def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined=True, ab_mode='LONG'):
     print("\n" + "=" * 80)
-    print(f"📊 CANVAS BATCH SCAN – v1.27 (Failure-Tracked) | Mode: {ab_mode}")
+    print(f"📊 CANVAS BATCH SCAN – v1.28 (DSE Archive Fallback) | Mode: {ab_mode}")
     print("=" * 80 + "\n")
 
     print("🔄 Prefetching live prices + market data (single API call)...")
@@ -4235,6 +4635,9 @@ def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined
         _LIVE_CACHE.prefetch()
     except Exception:
         print("⚠️ Prefetch failed, will retry per-symbol.")
+
+    # v1.28: probe both history sources so you can see at a glance what's working
+    _probe_history_sources()
 
     stock_list = get_dse_stock_list(force_refresh=False)
     total = len(stock_list)
@@ -4250,7 +4653,7 @@ def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined
     print(f"⚙️  Max Workers: {MAX_WORKERS}\n")
 
     reports = []
-    failed: List[Dict[str, str]] = []   # v1.27: dicts, not strings
+    failed: List[Dict[str, str]] = []
     completed = 0
     temp_csv_path = f"{RESULTS_DIR}/canvas_scan_TEMP_{dt.datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 
@@ -4292,31 +4695,30 @@ def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined
 
     rows = []
     for r in reports:
-        rows.append({'Symbol':r.symbol,'Price':round(r.current_price,2),
-            'Canvas':r.canvas_signal,'Canvas_Reason':r.canvas_reason,
-            'FinalSignal':r.final_signal,'FinalScore':r.final_score,
-            'AssetClass':r.asset_class,
-            'Verdict':r.verdict,'Forecast':r.forecast_signal,
-            'Fuzzy':r.fuzzy_Action,'Fz_Gate':round(r.fuzzy_v3_S_gate,4),
-            'Fz_Rank':round(r.fuzzy_v3_S_rank,4),'Fz_C_raw':round(r.fuzzy_v3_C_raw,4),
-            'Fz_TV':round(r.fuzzy_v3_turnover_velocity,6),
-            'Fz_GatePass':r.fuzzy_v3_hard_gate_pass,
-            'RR_Prelim':round(r.reward_risk_ratio,3),
-            'RR_Final':round(r.reward_risk_final,3),
-            'Radar':r.radar_score,'AB':r.ab_variant,
-            'SME':r.sme_catcher_level,'SME_L':round(r.sme_l_score,3),
-            'SME_Entry':r.sme_entry_type,'SME_Health':r.sme_data_health,
-            'ADTV20':round(r.sme_adtv_20,0),
-            'HikeTier':r.hike_tier,
-            'ExtensionPct':round(r.extension_pct_from_sma20,3),
-            'SMA20':round(r.sma20_value,3),
-            'VolDivDays':r.volume_divergence_days,
-            'VolDivTotal':r.volume_divergence_total,
-            'TierEntryOK':r.hike_tier_entry_allowed})
+        rows.append({'Symbol': r.symbol, 'Price': round(r.current_price, 2),
+                     'Canvas': r.canvas_signal, 'Canvas_Reason': r.canvas_reason,
+                     'FinalSignal': r.final_signal, 'FinalScore': r.final_score,
+                     'AssetClass': r.asset_class,
+                     'Verdict': r.verdict, 'Forecast': r.forecast_signal,
+                     'Fuzzy': r.fuzzy_Action, 'Fz_Gate': round(r.fuzzy_v3_S_gate, 4),
+                     'Fz_Rank': round(r.fuzzy_v3_S_rank, 4), 'Fz_C_raw': round(r.fuzzy_v3_C_raw, 4),
+                     'Fz_TV': round(r.fuzzy_v3_turnover_velocity, 6),
+                     'Fz_GatePass': r.fuzzy_v3_hard_gate_pass,
+                     'RR_Prelim': round(r.reward_risk_ratio, 3),
+                     'RR_Final': round(r.reward_risk_final, 3),
+                     'Radar': r.radar_score, 'AB': r.ab_variant,
+                     'SME': r.sme_catcher_level, 'SME_L': round(r.sme_l_score, 3),
+                     'SME_Entry': r.sme_entry_type, 'SME_Health': r.sme_data_health,
+                     'ADTV20': round(r.sme_adtv_20, 0),
+                     'HikeTier': r.hike_tier,
+                     'ExtensionPct': round(r.extension_pct_from_sma20, 3),
+                     'SMA20': round(r.sma20_value, 3),
+                     'VolDivDays': r.volume_divergence_days,
+                     'VolDivTotal': r.volume_divergence_total,
+                     'TierEntryOK': r.hike_tier_entry_allowed})
     df_canvas = pd.DataFrame(rows)
     df_canvas.to_csv(final_csv_path, index=False, encoding='utf-8-sig')
 
-    # v1.27: write failure CSV
     if failed:
         try:
             pd.DataFrame(failed).to_csv(failures_csv_path, index=False, encoding='utf-8-sig')
@@ -4325,8 +4727,10 @@ def canvas_batch_scan(account_equity=1000000.0, generate_buy_cond=True, combined
             failures_csv_path = None
 
     if os.path.exists(temp_csv_path):
-        try: os.remove(temp_csv_path)
-        except Exception: pass
+        try:
+            os.remove(temp_csv_path)
+        except Exception:
+            pass
 
     try:
         dump_fuzzy_diagnostics(reports, timestamp)
@@ -4381,9 +4785,7 @@ def canvas_analyze_one(symbol):
 # ==================== MAIN ====================
 if __name__ == "__main__":
     print("\n🚀 Starting Automated DSE Scan for GitHub Actions...")
-    
-    # Runs the full batch scan automatically. 
-    # Equity is set to 1,000,000 BDT. You can change this number if you want.
+
     try:
         canvas_batch_scan(account_equity=1000000.0, ab_mode='LONG')
     except Exception as e:
