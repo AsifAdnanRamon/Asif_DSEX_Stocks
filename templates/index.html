@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSE Scanner – Web</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Noto Sans Bengali', system-ui, sans-serif;
+         background:#eef2f7; margin:0; padding:20px; color:#1f2937; }
+  .wrap { max-width: 780px; margin: 0 auto; }
+  .card { background:#fff; border-radius:16px; padding:24px;
+          box-shadow:0 8px 30px rgba(15,23,42,0.07); margin-bottom:16px; }
+  h1 { margin:0 0 6px; font-size:22px; }
+  .sub { color:#64748b; font-size:13.5px; margin-bottom:18px; }
+  label { display:block; font-size:13px; font-weight:600; margin:12px 0 4px; }
+  input, select { width:100%; padding:10px 12px; border:1px solid #cbd5e1;
+                  border-radius:10px; font-size:14px; }
+  button { margin-top:18px; width:100%; padding:14px; border:none;
+           border-radius:12px; background:#2563eb; color:#fff;
+           font-size:16px; font-weight:700; cursor:pointer; }
+  button:hover { background:#1d4ed8; }
+  button:disabled { background:#94a3b8; cursor:not-allowed; }
+  #status { margin-top:16px; font-size:14px; }
+  .status-box { background:#f1f5f9; border-radius:12px; padding:14px;
+                white-space:pre-wrap; font-family:monospace; font-size:12px;
+                max-height:220px; overflow:auto; }
+  .link-btn { display:inline-block; margin-top:12px; padding:12px 20px;
+              background:#059669; color:#fff; border-radius:10px;
+              text-decoration:none; font-weight:700; }
+  .reports-list a { display:block; padding:10px 14px; background:#f8fafc;
+                    border-radius:10px; margin-bottom:6px; color:#1e40af;
+                    text-decoration:none; font-size:13.5px; }
+  .reports-list a:hover { background:#e0e7ff; }
+  .spinner { display:inline-block; width:14px; height:14px;
+             border:2px solid #cbd5e1; border-top-color:#2563eb;
+             border-radius:50%; animation:spin .8s linear infinite;
+             vertical-align:middle; margin-right:8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card">
+    <h1>📊 DSE Canvas Scanner — Web</h1>
+    <div class="sub">Start a scan; when it finishes, the Bangla report opens automatically.</div>
+
+    <label>Account Equity (BDT)</label>
+    <input id="equity" type="number" value="1000000" step="1000">
+
+    <label>A/B Mode</label>
+    <select id="abMode">
+      <option value="LONG">LONG (default)</option>
+      <option value="SHORT">SHORT</option>
+    </select>
+
+    <button id="scanBtn" onclick="startScan()">🚀 Start Scan</button>
+
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <h1 style="font-size:18px;">📁 Past Reports</h1>
+    <div id="reportsList" class="reports-list">Loading…</div>
+  </div>
+
+</div>
+
+<script>
+let pollTimer = null;
+
+async function startScan() {
+  const btn = document.getElementById('scanBtn');
+  btn.disabled = true;
+  document.getElementById('status').innerHTML =
+      '<span class="spinner"></span>Starting…';
+
+  const fd = new FormData();
+  fd.append('equity', document.getElementById('equity').value);
+  fd.append('ab_mode', document.getElementById('abMode').value);
+
+  const r = await fetch('/scan', { method: 'POST', body: fd });
+  const j = await r.json();
+  pollStatus(j.job_id);
+}
+
+async function pollStatus(jobId) {
+  const r = await fetch('/status/' + jobId);
+  const j = await r.json();
+  const statusEl = document.getElementById('status');
+
+  if (j.status === 'queued' || j.status === 'running') {
+    statusEl.innerHTML = '<span class="spinner"></span>Scanning… this takes a few minutes.';
+    pollTimer = setTimeout(() => pollStatus(jobId), 3000);
+    return;
+  }
+
+  if (j.status === 'done') {
+    statusEl.innerHTML =
+      '<b style="color:#059669;">✅ Done!</b>' +
+      (j.report ? '<br><a class="link-btn" target="_blank" href="/reports/' + j.report + '">Open Report</a>' : '');
+    loadReports();
+    document.getElementById('scanBtn').disabled = false;
+    return;
+  }
+
+  if (j.status === 'error') {
+    statusEl.innerHTML = '<b style="color:#dc2626;">❌ Error:</b><div class="status-box">' +
+                         (j.error || 'Unknown') + '</div>';
+    document.getElementById('scanBtn').disabled = false;
+  }
+}
+
+async function loadReports() {
+  const r = await fetch('/reports');
+  const files = await r.json();
+  const el = document.getElementById('reportsList');
+  el.innerHTML = files.length
+    ? files.map(f => '<a href="/reports/' + f + '" target="_blank">📄 ' + f + '</a>').join('')
+    : 'No reports yet.';
+}
+
+loadReports();
+</script>
+</body>
+</html>
